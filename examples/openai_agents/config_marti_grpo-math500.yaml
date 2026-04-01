@@ -1,10 +1,12 @@
-experiment_name: gsm8k-grpo
+experiment_name: multi-agents-math500-grpo-marti-COA
 trial_name: trial0
 
 seed: 1
 enable_offload: false
-total_train_epochs: 10
+total_train_epochs: 100
 tokenizer_path: ${actor.path}
+
+reward_fn_path: "areal.reward.math500.math500_reward_fn"
 
 cluster:
   n_nodes: 1
@@ -14,12 +16,12 @@ cluster:
     type: nfs
     nfs_record_root: /home/xinglu/name_resolve
 
+allocation_mode: vllm:d8p1t1+d8p1t1
 
 scheduler:
   type: local
 
 rollout:
-  backend: "vllm:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 256
@@ -31,28 +33,32 @@ rollout:
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
+  openai:
+    # this should set the token limit for whole session (prompt and all turns of responses)
+    engine_max_tokens: 16384
 
 gconfig:
   n_samples: 4
   min_new_tokens: 0
-  max_new_tokens: 1024
+  max_tokens: 1600
   greedy: false
   temperature: 1.0
+  top_k: 100000000
+  top_p: 1.0
 
 actor:
-  backend: "fsdp:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /home/xinglu/model/Qwen3-0.6B
+  path: /home/xinglu/model/Qwen2.5-3B-Instruct
+  dtype: bfloat16
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
-  dtype: bfloat16
   mb_spec:
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 16384
   optimizer:
     type: adam
-    lr: 1.70e-5
+    lr: 1.0e-5
     weight_decay: 0.017
     beta1: 0.9
     beta2: 0.999
@@ -60,7 +66,7 @@ actor:
     lr_scheduler_type: constant
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.001
-  eps_clip: 0.4
+  eps_clip: 0.2
   temperature: ${gconfig.temperature}
   reward_scaling: 10.0
   reward_bias: -0.5
@@ -87,7 +93,6 @@ actor:
       env_vars:
         VLLM_USE_V1: "1"
         VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-        TASK_QUEUE_ENABLE: "2"
         HCCL_EXEC_TIMEOUT: "14400"
         HCCL_OP_EXPANSION_MODE: "HOST"
         ACL_DEVICE_SYNC_TIMEOUT: "14400"
@@ -96,9 +101,12 @@ actor:
         ACL_STREAM_TIMEOUT: "14500000"
         HCCL_CONNECT_TIMEOUT: "7200"
         PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+        HCCL_IF_BASE_PORT: "60000"
+        HCCL_HOST_SOCKET_PORT_RANGE: "60000-60099"
+        HCCL_NPU_SOCKET_PORT_RANGE: "60000-60099"
+
 
 ref:
-  backend: ${actor.backend}
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: ${actor.path}
@@ -113,17 +121,6 @@ ref:
     target: actor
   scheduling_spec: ${actor.scheduling_spec}
 
-# SGLang
-sglang:
-  model_path: ${actor.path}
-  random_seed: ${seed}
-  skip_tokenizer_init: true
-  dtype: ${actor.dtype}
-  max_running_requests: null
-  context_length: 32768
-  mem_fraction_static: 0.8
-
-# vLLM
 vllm:
   model: ${actor.path}
   seed: ${seed}
@@ -131,7 +128,7 @@ vllm:
   dtype: ${actor.dtype}
   max_model_len: 32768
   gpu_memory_utilization: 0.8
-  enforce_eager: true
+  enforce_eager: false
 
 # datasets
 train_dataset:
@@ -139,7 +136,7 @@ train_dataset:
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /home/xinglu/data/gsm8k
+  path: /home/xinglu/data/MATH-500
   type: rl
   max_length: 1024
 
@@ -147,7 +144,7 @@ valid_dataset:
   batch_size: 256
   pin_memory: true
   num_workers: 4
-  path: /home/xinglu/data/gsm8k
+  path: /home/xinglu/data/MATH-500
   type: rl
 
 # Utilities
@@ -184,7 +181,7 @@ stats_logger:
     mode: disabled
   swanlab:
     project: xinglu
-    name: areal_grpo_test
+    name: marti_COA_grpo_shared_math500-betterCQlty-sameLinzi
     mode: cloud
     api_key: MHr2kFFcp5QZLSCPytEeE
 
