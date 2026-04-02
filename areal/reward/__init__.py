@@ -213,7 +213,7 @@ class MathMultipleChoiceVerifyWorker:
 
             return score
 
-        except Exception:
+        except (Exception, TimeoutException):
             logger.warning(
                 f"Exception in MathMultipleChoiceVerifyWorker.verify for response={response} and ground_truth={ground_truth}",
                 exc_info=True,
