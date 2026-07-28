@@ -1824,6 +1824,7 @@ class vLLMConfig:
     skip_tokenizer_init: bool = False
     enforce_eager: bool = False
     dtype: str = "bfloat16"
+    logprobs_mode: str = "raw_logprobs"
     distributed_executor_backend: str = "mp"
     # original
     max_num_seqs: int = 256
