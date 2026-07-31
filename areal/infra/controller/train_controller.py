@@ -715,11 +715,14 @@ class TrainController:
 
     def offload(self) -> None:
         """Offload model parameters to CPU across all train workers."""
-        self._custom_function_call("offload")
+        # These calls have no payload.  More importantly, after TMS pauses CUDA
+        # allocations, broadcasting even an empty RPC payload on the GPU makes
+        # the subsequent onload call fail before the engine can resume memory.
+        self._custom_function_call("offload", rpc_meta={"broadcast": False})
 
     def onload(self) -> None:
         """Onload model parameters to GPU across all train workers."""
-        self._custom_function_call("onload")
+        self._custom_function_call("onload", rpc_meta={"broadcast": False})
 
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
@@ -748,7 +751,15 @@ class TrainController:
         run_async_task(_call)
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
-        self._custom_function_call("save_perf_tracer", step=step, force=force)
+        # The reference engine can still be TMS-offloaded when the trainer
+        # persists its trace.  The scalar arguments do not require a GPU-side
+        # tensor broadcast, which is invalid while CUDA allocations are paused.
+        self._custom_function_call(
+            "save_perf_tracer",
+            step=step,
+            force=force,
+            rpc_meta={"broadcast": False},
+        )
 
     def prepare_batch(
         self,
