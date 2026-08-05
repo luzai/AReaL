@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
+import shutil
 from typing import TYPE_CHECKING
 
 from transformers import PreTrainedTokenizerFast
@@ -18,6 +20,10 @@ from areal.utils.async_checkpoint import AsyncCheckpointManager, AsyncMode
 from areal.utils.logging import getLogger
 
 logger = getLogger("Saver")
+
+_REGULAR_CHECKPOINT_RE = re.compile(
+    r"^epoch(?P<epoch>\d+)epochstep(?P<step>\d+)globalstep(?P<global_step>\d+)$"
+)
 
 
 class Saver:
@@ -89,6 +95,38 @@ class Saver:
         os.makedirs(path, exist_ok=True)
         return path
 
+    def _prune_checkpoints(self, name: str) -> None:
+        keep_last = self.config.keep_last
+        if keep_last is None:
+            return
+
+        root = Saver.get_model_save_root(
+            self.config.experiment_name,
+            self.config.trial_name,
+            self.config.fileroot,
+            name,
+        )
+        checkpoints: list[tuple[int, int, int, str]] = []
+        for entry in os.scandir(root):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            match = _REGULAR_CHECKPOINT_RE.fullmatch(entry.name)
+            if match is None:
+                continue
+            checkpoints.append(
+                (
+                    int(match.group("global_step")),
+                    int(match.group("epoch")),
+                    int(match.group("step")),
+                    entry.path,
+                )
+            )
+
+        checkpoints.sort()
+        for _, _, _, path in checkpoints[:-keep_last]:
+            logger.info("Pruning old checkpoint: %s", path)
+            shutil.rmtree(path)
+
     def state_dict(self):
         return self.freq_ctl.state_dict()
 
@@ -156,6 +194,7 @@ class Saver:
                 base_model_path=base_model_path,
             )
             engine.save(meta)
+            self._prune_checkpoints(name)
 
     def _async_save(
         self,
@@ -177,7 +216,14 @@ class Saver:
 
         from areal.experimental.engine.archon_checkpoint import save_model_to_hf
 
-        save_model_to_hf(engine, path, tokenizer, processor, async_mgr=mgr)
+        save_model_to_hf(
+            engine,
+            path,
+            tokenizer,
+            processor,
+            async_mgr=mgr,
+            post_save_fn=lambda: self._prune_checkpoints(name),
+        )
 
     def maybe_wait_for_staging(self):
         """Wait for all engines' staging to complete. Call before ppo_update."""

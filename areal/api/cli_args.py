@@ -2482,6 +2482,14 @@ class EvaluatorConfig(_Timer):
 class SaverConfig(_Timer):
     """Configuration for model checkpoint saving scheduling and timing."""
 
+    keep_last: int | None = field(
+        default=None,
+        metadata={
+            "help": "Keep only the newest N regular model checkpoints. "
+            "None disables checkpoint pruning. Recovery checkpoints are not pruned."
+        },
+    )
+
     mode: str = field(
         default="auto",
         metadata={
@@ -2498,6 +2506,8 @@ class SaverConfig(_Timer):
     )
 
     def __post_init__(self):
+        if self.keep_last is not None and self.keep_last < 1:
+            raise ValueError("keep_last must be at least 1 or None")
         valid_modes = {"auto", "sync", "async"}
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid mode '{self.mode}'. Valid: {valid_modes}")

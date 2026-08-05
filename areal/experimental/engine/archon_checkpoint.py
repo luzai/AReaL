@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import struct
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -223,6 +224,7 @@ def save_model_to_hf(
     tokenizer: PreTrainedTokenizerFast | None,
     processor: AutoProcessor | None = None,
     async_mgr: AsyncCheckpointManager | None = None,
+    post_save_fn: Callable[[], None] | None = None,
 ) -> None:
     """Save model in HuggingFace format using DCP infrastructure.
 
@@ -234,6 +236,8 @@ def save_model_to_hf(
         async_mgr: Optional async checkpoint manager. When provided and async
             is enabled, dcp.async_save() is used instead of dcp.save().
             The manager's post_upload_fn is set to handle consolidation.
+        post_save_fn: Optional callback run on rank zero after the completed
+            checkpoint is atomically moved into place.
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
@@ -308,6 +312,8 @@ def save_model_to_hf(
             if os.path.exists(path):
                 shutil.rmtree(path)
             os.rename(tmp_path, path)
+            if post_save_fn is not None:
+                post_save_fn()
         dist.barrier(group=process_group)
 
     if is_async:
