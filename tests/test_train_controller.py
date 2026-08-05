@@ -701,11 +701,13 @@ class TestTrainControllerExportStats:
 
         # Mock the scheduler to return stats
         expected_stats = {"loss": 0.5, "accuracy": 0.95}
+        export_stats_rpc_meta = []
 
         async def mock_async_call(*args, **kwargs):
             if kwargs.get("method") == "export_stats" or (
                 len(args) > 1 and args[1] == "export_stats"
             ):
+                export_stats_rpc_meta.append(kwargs.get("rpc_meta"))
                 return expected_stats
             return None
 
@@ -714,6 +716,10 @@ class TestTrainControllerExportStats:
         result = train_controller.export_stats()
         for k in expected_stats:
             assert result[k] == expected_stats[k]
+        assert export_stats_rpc_meta
+        assert all(
+            rpc_meta == {"broadcast": False} for rpc_meta in export_stats_rpc_meta
+        )
 
 
 class TestTrainControllerDispatchInputs:

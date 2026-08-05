@@ -624,7 +624,13 @@ class TrainController:
         # Statistics have been aggregated and synchronized across workers
         # All results should be identical, so return the first one
         stats = stats_tracker.export_all()
-        stats.update(self._custom_function_call("export_stats"))
+        # export_stats is an argument-free call executed independently on every
+        # worker.  Broadcasting its empty argument container is unnecessary and
+        # can touch CUDA after TMS has offloaded the engine, where c10d's object
+        # broadcast may fail while materializing its metadata ByteTensor.
+        stats.update(
+            self._custom_function_call("export_stats", rpc_meta={"broadcast": False})
+        )
         return stats
 
     # ==================== ENGINE RPC WRAPPERS ====================
