@@ -1152,7 +1152,7 @@ class MegatronEngine(TrainEngine):
             return res
         return split_batch(res, meta)
 
-    def export_stats(self) -> dict[str, float]:
+    def export_stats(self, reset: bool = True) -> dict[str, float]:
         key_sync_group = None
         if self.parallel_strategy.context_parallel_size > 1:
             key_sync_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1160,6 +1160,7 @@ class MegatronEngine(TrainEngine):
             data = stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
                 key_sync_group=key_sync_group,
+                reset=reset,
             )
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Some log info only exist in last pipeline rank

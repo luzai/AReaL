@@ -834,11 +834,12 @@ class ArchonEngine(TrainEngine):
 
         self.is_offload = False
 
-    def export_stats(self) -> dict[str, float]:
+    def export_stats(self, reset: bool = True) -> dict[str, float]:
         assert self._initialized
         with self._offload_aware_context():
             data = stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
+                reset=reset,
             )
         if self.parallel_dims.pp_enabled:
             data_list = [data]

@@ -721,6 +721,31 @@ class TestTrainControllerExportStats:
             rpc_meta == {"broadcast": False} for rpc_meta in export_stats_rpc_meta
         )
 
+    def test_export_stats_can_peek_without_reset(self, train_controller, ft_spec):
+        train_controller.initialize(
+            role="train_worker",
+            ft_spec=ft_spec,
+        )
+
+        reset_values = []
+
+        async def mock_async_call(*args, **kwargs):
+            if kwargs.get("method") == "export_stats" or (
+                len(args) > 1 and args[1] == "export_stats"
+            ):
+                if "reset" in kwargs:
+                    reset_values.append(kwargs["reset"])
+                return {"ppo_actor/task_reward/avg": 0.5}
+            return None
+
+        train_controller.scheduler.async_call_engine = mock_async_call
+
+        result = train_controller.export_stats(reset=False)
+
+        assert result["ppo_actor/task_reward/avg"] == 0.5
+        assert reset_values
+        assert all(reset is False for reset in reset_values)
+
 
 class TestTrainControllerDispatchInputs:
     """Tests for input dispatching across DP groups."""

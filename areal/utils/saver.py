@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import getpass
+import json
+import math
 import os
 import re
 import shutil
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from transformers import PreTrainedTokenizerFast
@@ -24,6 +27,7 @@ logger = getLogger("Saver")
 _REGULAR_CHECKPOINT_RE = re.compile(
     r"^epoch(?P<epoch>\d+)epochstep(?P<step>\d+)globalstep(?P<global_step>\d+)$"
 )
+_BEST_CHECKPOINT_METADATA = "best_checkpoint.json"
 
 
 class Saver:
@@ -123,9 +127,90 @@ class Saver:
             )
 
         checkpoints.sort()
-        for _, _, _, path in checkpoints[:-keep_last]:
+        protected = {path for _, _, _, path in checkpoints[-keep_last:]}
+        best = self._load_best_checkpoint(name)
+        if best is not None:
+            protected.add(os.path.join(root, str(best["checkpoint"])))
+        for _, _, _, path in checkpoints:
+            if path in protected:
+                continue
             logger.info("Pruning old checkpoint: %s", path)
             shutil.rmtree(path)
+
+    def _best_checkpoint_metadata_path(self, name: str) -> str:
+        root = Saver.get_model_save_root(
+            self.config.experiment_name,
+            self.config.trial_name,
+            self.config.fileroot,
+            name,
+        )
+        return os.path.join(root, _BEST_CHECKPOINT_METADATA)
+
+    def _load_best_checkpoint(self, name: str) -> dict | None:
+        metadata_path = self._best_checkpoint_metadata_path(name)
+        try:
+            with open(metadata_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return None
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid best checkpoint metadata: {metadata_path}")
+        return data
+
+    def _is_best_metric(self, name: str, metric_value: float) -> bool:
+        best = self._load_best_checkpoint(name)
+        if best is None:
+            return True
+        if best.get("metric") != self.config.keep_best_metric:
+            raise ValueError(
+                "Best-checkpoint metric changed for an existing run: "
+                f"{best.get('metric')} -> {self.config.keep_best_metric}"
+            )
+        if best.get("mode") != self.config.keep_best_mode:
+            raise ValueError(
+                "Best-checkpoint mode changed for an existing run: "
+                f"{best.get('mode')} -> {self.config.keep_best_mode}"
+            )
+        best_value = float(best["metric_value"])
+        if self.config.keep_best_mode == "max":
+            return metric_value > best_value
+        return metric_value < best_value
+
+    def _record_best_checkpoint(
+        self,
+        name: str,
+        checkpoint_path: str,
+        metric_value: float,
+    ) -> None:
+        metadata_path = self._best_checkpoint_metadata_path(name)
+        tmp_path = f"{metadata_path}.tmp.{os.getpid()}"
+        data = {
+            "metric": self.config.keep_best_metric,
+            "mode": self.config.keep_best_mode,
+            "metric_value": metric_value,
+            "checkpoint": os.path.basename(checkpoint_path),
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, metadata_path)
+        logger.info(
+            "Recorded best checkpoint: %s (%s=%s)",
+            checkpoint_path,
+            self.config.keep_best_metric,
+            metric_value,
+        )
+
+    def _complete_save(
+        self,
+        name: str,
+        checkpoint_path: str,
+        metric_value: float | None,
+    ) -> None:
+        if metric_value is not None:
+            self._record_best_checkpoint(name, checkpoint_path, metric_value)
+        self._prune_checkpoints(name)
 
     def state_dict(self):
         return self.freq_ctl.state_dict()
@@ -167,10 +252,27 @@ class Saver:
         tokenizer: PreTrainedTokenizerFast | None = None,
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
+        metrics: Mapping[str, float] | None = None,
     ):
-        if not self.freq_ctl.check(
+        regular_save = self.freq_ctl.check(
             epochs=int(step == self.ft_spec.steps_per_epoch - 1), steps=1
-        ):
+        )
+        best_metric_value = None
+        if self.config.keep_best_metric is not None and name == "default":
+            if metrics is None or self.config.keep_best_metric not in metrics:
+                raise ValueError(
+                    "Configured best-checkpoint metric is missing: "
+                    f"{self.config.keep_best_metric}"
+                )
+            metric_value = float(metrics[self.config.keep_best_metric])
+            if not math.isfinite(metric_value):
+                raise ValueError(
+                    "Best-checkpoint metric must be finite, got "
+                    f"{metric_value} for {self.config.keep_best_metric}"
+                )
+            if self._is_best_metric(name, metric_value):
+                best_metric_value = metric_value
+        if not regular_save and best_metric_value is None:
             return
         path = Saver.get_model_save_path(
             self.config.experiment_name,
@@ -183,7 +285,14 @@ class Saver:
         )
 
         if self._should_use_async(engine):
-            self._async_save(engine, path, name, tokenizer, processor)
+            self._async_save(
+                engine,
+                path,
+                name,
+                tokenizer,
+                processor,
+                best_metric_value,
+            )
         else:
             meta = SaveLoadMeta(
                 path=path,
@@ -194,7 +303,7 @@ class Saver:
                 base_model_path=base_model_path,
             )
             engine.save(meta)
-            self._prune_checkpoints(name)
+            self._complete_save(name, path, best_metric_value)
 
     def _async_save(
         self,
@@ -203,6 +312,7 @@ class Saver:
         name: str,
         tokenizer: PreTrainedTokenizerFast | None,
         processor: AutoProcessor | None,
+        best_metric_value: float | None,
     ):
         """Archon async save."""
         from areal.experimental.engine.archon_engine import ArchonEngine
@@ -222,7 +332,7 @@ class Saver:
             tokenizer,
             processor,
             async_mgr=mgr,
-            post_save_fn=lambda: self._prune_checkpoints(name),
+            post_save_fn=lambda: self._complete_save(name, path, best_metric_value),
         )
 
     def maybe_wait_for_staging(self):

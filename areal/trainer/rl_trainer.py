@@ -788,6 +788,14 @@ class PPOTrainer:
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
 
+            # Peek at this update's actor metrics before deciding whether a
+            # newly observed global-best checkpoint must be saved. Keep the
+            # trackers intact for the normal logging/export path below.
+            if config.saver.keep_best_metric is not None:
+                self._actor_stats_for_checkpoint = self.actor.export_stats(reset=False)
+            else:
+                self._actor_stats_for_checkpoint = {}
+
             with (
                 stats_tracker.record_timing("save"),
                 perf_tracer.trace_scope(
@@ -1185,6 +1193,7 @@ class PPOTrainer:
             global_step,
             tokenizer=self.tokenizer,
             processor=self.processor,
+            metrics=self._actor_stats_for_checkpoint,
         )
         if self.critic is not None:
             self.saver.save(

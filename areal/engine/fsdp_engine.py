@@ -902,10 +902,11 @@ class FSDPEngine(TrainEngine):
             return result
         return split_batch(result, meta)
 
-    def export_stats(self) -> dict[str, float]:
+    def export_stats(self, reset: bool = True) -> dict[str, float]:
         with self._offload_aware_context():
             return stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
+                reset=reset,
             )
 
     def offload(self) -> None:
@@ -1841,18 +1842,14 @@ class FSDPEngine(TrainEngine):
                     if "image_grid_thw" in m
                 ]
                 if image_grid_thw_list:
-                    image_grid_thw = torch.cat(image_grid_thw_list).to(
-                        input_ids.device
-                    )
+                    image_grid_thw = torch.cat(image_grid_thw_list).to(input_ids.device)
                 video_grid_thw_list = [
                     m["video_grid_thw"]
                     for m in multi_modal_input
                     if "video_grid_thw" in m
                 ]
                 if video_grid_thw_list:
-                    video_grid_thw = torch.cat(video_grid_thw_list).to(
-                        input_ids.device
-                    )
+                    video_grid_thw = torch.cat(video_grid_thw_list).to(input_ids.device)
 
             position_ids = self.model.model.compute_3d_position_ids(
                 input_ids=input_ids,
@@ -2042,9 +2039,7 @@ class FSDPEngine(TrainEngine):
         else:
             token_ids = token_ids.to(logits.device)
 
-        bits = action_mask_bits.reshape(-1).to(
-            device=logits.device, dtype=torch.uint8
-        )
+        bits = action_mask_bits.reshape(-1).to(device=logits.device, dtype=torch.uint8)
         if bits.numel() > logits.shape[0]:
             raise RuntimeError("Pacman action mask is longer than actor logits")
         if bits.numel() < logits.shape[0]:
@@ -2056,9 +2051,7 @@ class FSDPEngine(TrainEngine):
         bits = torch.roll(bits, shifts=-1, dims=0)
         allowed = (
             bits.unsqueeze(-1)
-            & torch.tensor(
-                [1, 2, 4, 8], dtype=torch.uint8, device=logits.device
-            )
+            & torch.tensor([1, 2, 4, 8], dtype=torch.uint8, device=logits.device)
         ).bool()
         active = allowed.any(dim=-1)
         if not active.any():
