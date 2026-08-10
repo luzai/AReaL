@@ -270,10 +270,21 @@ class PPOActor:
         reward_score = data["rewards"]
         seqlens = attn_mask.sum(-1)
 
+        # Pure-DP RPC workers may deliberately keep the complete advantages
+        # batch on CPU to avoid duplicating it on CUDA before minibatch
+        # construction.  Stats are reduced with the engine's NCCL DP group,
+        # so retain only the comparatively small tracker tensors on CUDA.
+        def _stats_tensor(value: torch.Tensor) -> torch.Tensor:
+            return value.to(self.engine.device, non_blocking=True)
+
+        reward_score_stats = _stats_tensor(reward_score)
+        seqlens_stats = _stats_tensor(seqlens)
+        loss_mask_stats = _stats_tensor(loss_mask)
+
         ########## Logging code starts ##########
         result_denominators = {
-            "correct_n_seqs": (reward_score > 0).bool(),
-            "incorrect_n_seqs": (reward_score <= 0).bool(),
+            "correct_n_seqs": (reward_score_stats > 0).bool(),
+            "incorrect_n_seqs": (reward_score_stats <= 0).bool(),
         }
         if self.config.log_agent_stats:
             if "begin_of_trajectory" not in data:
@@ -284,35 +295,35 @@ class PPOActor:
                 raise RuntimeError(
                     "`log_agent_stats_keys` should not be empty when log_agent_stats=True"
                 )
-            agent_denominator = (data["begin_of_trajectory"] > 0).bool()
+            agent_denominator = _stats_tensor((data["begin_of_trajectory"] > 0).bool())
             result_denominators["agent"] = agent_denominator
         global_denominators = dict(
-            n_seqs=torch.ones_like(reward_score, dtype=torch.bool),
-            n_tokens=infer_token_denominator(data, loss_mask),
-            n_valid_tokens=loss_mask.bool(),
+            n_seqs=torch.ones_like(reward_score_stats, dtype=torch.bool),
+            n_tokens=_stats_tensor(infer_token_denominator(data, loss_mask)),
+            n_valid_tokens=loss_mask_stats.bool(),
             **result_denominators,
         )
         stats_tracker.denominator(**global_denominators)
         stats_tracker.stat(
-            correct_seq_len=seqlens.float(), denominator="correct_n_seqs"
+            correct_seq_len=seqlens_stats.float(), denominator="correct_n_seqs"
         )
         stats_tracker.stat(
-            incorrect_seq_len=seqlens.float(), denominator="incorrect_n_seqs"
+            incorrect_seq_len=seqlens_stats.float(), denominator="incorrect_n_seqs"
         )
 
         stats = dict(
-            advantages=data["advantages"],
-            kl_rewards=data["kl_rewards"],
-            final_reward=data["tot_rewards"],
+            advantages=_stats_tensor(data["advantages"]),
+            kl_rewards=_stats_tensor(data["kl_rewards"]),
+            final_reward=_stats_tensor(data["tot_rewards"]),
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
         seq_stats = dict(
-            no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
-            task_reward=reward_score.float(),
-            prompt_len=prompt_lens.float(),
-            seq_len=seqlens.float(),
+            no_eos_ratios=(seqlens_stats == attn_mask.shape[-1]).float(),
+            task_reward=reward_score_stats.float(),
+            prompt_len=_stats_tensor(prompt_lens).float(),
+            seq_len=seqlens_stats.float(),
         )
         stats_tracker.stat(**seq_stats, denominator="n_seqs")
         scalars = dict(
@@ -333,10 +344,23 @@ class PPOActor:
 
         if self.config.log_agent_stats:
             stats_tracker.stat(
-                **{k: data[k].float() for k in self.config.log_agent_stats_keys},
+                **{
+                    k: _stats_tensor(data[k]).float()
+                    for k in self.config.log_agent_stats_keys
+                },
                 denominator="agent",
             )
         ########## Logging code ends ##########
+
+        del (
+            global_denominators,
+            result_denominators,
+            reward_score_stats,
+            seqlens_stats,
+            loss_mask_stats,
+            stats,
+            seq_stats,
+        )
 
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function

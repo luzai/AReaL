@@ -26,6 +26,7 @@ from queue import Queue
 from threading import Lock, Thread
 from typing import Annotated, Any
 
+import torch.distributed as dist
 from flask import Blueprint, jsonify, request
 from pydantic import BaseModel, StringConstraints, ValidationError
 
@@ -87,6 +88,43 @@ def _should_broadcast_payload(
             f"Invalid rpc_meta.broadcast: expected bool, got {type(broadcast)}"
         )
     return broadcast
+
+
+def _should_stage_ppo_payload_on_cpu(
+    method_name: str,
+    should_broadcast: bool,
+    group: dist.ProcessGroup,
+) -> bool:
+    """Keep a pure-DP PPO batch on CPU until its minibatches are consumed.
+
+    A context/model-parallel group of size one has no peer that needs an RPC
+    payload broadcast.  Moving the complete advantages batch to CUDA before
+    :meth:`ppo_update` eagerly duplicates the full batch when PPO constructs
+    its minibatches and can exhaust device memory before the first forward.
+    """
+
+    return (
+        should_broadcast
+        and method_name in {"ppo_update", "safety_probe_backward"}
+        and dist.get_world_size(group) == 1
+    )
+
+
+def _should_store_rpc_result_on_cpu(
+    method_name: str,
+    *,
+    is_train_engine: bool,
+    is_initialized: bool,
+    is_data_parallel_head: bool,
+) -> bool:
+    """Return whether a large reusable RPC result should be CPU-backed."""
+
+    return (
+        method_name == "compute_advantages"
+        and is_train_engine
+        and is_initialized
+        and is_data_parallel_head
+    )
 
 
 engine_bp = Blueprint("engine", __name__)
@@ -470,24 +508,38 @@ def call_engine_method():
                     engine=engine, rpc_meta=rpc_meta
                 )
                 if should_broadcast:
-                    logger.debug(f"Broadcasting RPC payload for method: {method_name}")
-                    args_bcast = tensor_container_to(
-                        args, current_platform.current_device()
-                    )
-                    args_bcast = broadcast_tensor_container(
-                        args_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
-                    )
-                    kwargs_bcast = tensor_container_to(
-                        kwargs, current_platform.current_device()
-                    )
-                    kwargs_bcast = broadcast_tensor_container(
-                        kwargs_bcast,
-                        src_rank=engine.current_data_parallel_head(),
-                        group=engine.context_and_model_parallel_group,
-                    )
-                    logger.debug("Broadcasting RPC payload done.")
+                    broadcast_group = engine.context_and_model_parallel_group
+                    if _should_stage_ppo_payload_on_cpu(
+                        method_name, should_broadcast, broadcast_group
+                    ):
+                        args_bcast = tensor_container_to(args, "cpu")
+                        kwargs_bcast = tensor_container_to(kwargs, "cpu")
+                        logger.info(
+                            "PPO_CPU_STAGING_AUDIT phase=ppo_payload "
+                            "method=%s device=cpu group_world_size=1",
+                            method_name,
+                        )
+                    else:
+                        logger.debug(
+                            f"Broadcasting RPC payload for method: {method_name}"
+                        )
+                        args_bcast = tensor_container_to(
+                            args, current_platform.current_device()
+                        )
+                        args_bcast = broadcast_tensor_container(
+                            args_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=broadcast_group,
+                        )
+                        kwargs_bcast = tensor_container_to(
+                            kwargs, current_platform.current_device()
+                        )
+                        kwargs_bcast = broadcast_tensor_container(
+                            kwargs_bcast,
+                            src_rank=engine.current_data_parallel_head(),
+                            group=broadcast_group,
+                        )
+                        logger.debug("Broadcasting RPC payload done.")
 
                 logger.debug(f"Calling engine '{engine_name}' method: {method_name}")
 
@@ -592,6 +644,16 @@ def call_engine_method():
         is_train = isinstance(engine, TrainEngine)
         is_init = is_train and engine.initialized
         if not is_train or not is_init or engine.is_data_parallel_head():
+            if _should_store_rpc_result_on_cpu(
+                method_name,
+                is_train_engine=is_train,
+                is_initialized=is_init,
+                is_data_parallel_head=(
+                    engine.is_data_parallel_head() if is_init else False
+                ),
+            ):
+                result = tensor_container_to(result, "cpu")
+                logger.info("PPO_CPU_STAGING_AUDIT phase=store_advantages device=cpu")
             state = get_state()
             result = RTensor.remotize(result, node_addr=state.node_addr)
             serialized_result = serialize_value(result)
