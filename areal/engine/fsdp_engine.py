@@ -1924,6 +1924,16 @@ class FSDPEngine(TrainEngine):
         This method handles Ulysses SP padding and slicing, returning both
         the prepared model inputs and a context object for later processing.
         """
+        if self.parallel_helper.sp_size > 1 and any(
+            key in mb_item.orig_mb
+            for key in (
+                "pacman_action_mask_bits",
+                "pacman_allowed_token_ids",
+            )
+        ):
+            raise NotImplementedError(
+                "Pacman dynamic action masks do not yet support sequence parallelism"
+            )
         trie_node = None
         if self.parallel_helper.sp_size > 1:
             input_ids = mb_item.padded_mb["input_ids"]
@@ -1965,15 +1975,14 @@ class FSDPEngine(TrainEngine):
             # Recipe-owned policy metadata belongs to the loss context, not
             # the Hugging Face model forward kwargs. orig_mb retains it.
             inputs.pop("pacman_action_mask_bits", None)
+            inputs.pop("pacman_allowed_token_ids", None)
             trie_node = inputs.pop("trie_node", None)
             ulysses_pad_size = 0
 
-        if self.parallel_helper.sp_size > 1 and (
-            "pacman_action_mask_bits" in mb_item.orig_mb
-        ):
-            raise NotImplementedError(
-                "Pacman dynamic action masks do not yet support sequence parallelism"
-            )
+        # Equal-episode reduction weights are consumed only by the PPO loss.
+        # Keep them in orig_mb for loss_weight_fn and remove them from model kwargs.
+        inputs.pop("episode_loss_weights", None)
+
         ctx = FSDPTrainContext(
             model_inputs=inputs,
             mb_input=mb_item.orig_mb,
@@ -2007,65 +2016,110 @@ class FSDPEngine(TrainEngine):
         logits: torch.Tensor,
         labels: torch.Tensor,
         action_mask_bits: torch.Tensor | None,
+        allowed_token_ids: torch.Tensor | None,
         logprobs: torch.Tensor,
         entropy: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Normalize action-token probabilities over the rollout-time mask."""
-        if action_mask_bits is None:
+        if action_mask_bits is None and allowed_token_ids is None:
             return logprobs, entropy
+        if action_mask_bits is not None and allowed_token_ids is not None:
+            raise RuntimeError(
+                "Pacman atomic-action and option-token masks are mutually exclusive"
+            )
         if self.parallel_helper.tp_size > 1:
             raise NotImplementedError(
                 "Pacman dynamic action masks do not yet support tensor parallelism"
             )
 
-        token_ids = getattr(self, "_pacman_action_token_ids", None)
-        if token_ids is None:
-            encoded = [
-                self.tokenizer.encode(action, add_special_tokens=False)
-                for action in ("U", "D", "L", "R")
-            ]
-            if any(len(ids) != 1 for ids in encoded):
-                raise RuntimeError(
-                    "Pacman actions must each map to exactly one tokenizer token"
+        if allowed_token_ids is None:
+            token_ids = getattr(self, "_pacman_action_token_ids", None)
+            if token_ids is None:
+                encoded = [
+                    self.tokenizer.encode(action, add_special_tokens=False)
+                    for action in ("U", "D", "L", "R")
+                ]
+                if any(len(ids) != 1 for ids in encoded):
+                    raise RuntimeError(
+                        "Pacman actions must each map to exactly one tokenizer token"
+                    )
+                token_ids = torch.tensor(
+                    [ids[0] for ids in encoded],
+                    dtype=torch.long,
+                    device=logits.device,
                 )
-            token_ids = torch.tensor(
-                [ids[0] for ids in encoded],
-                dtype=torch.long,
-                device=logits.device,
+                if token_ids.unique().numel() != 4:
+                    raise RuntimeError("Pacman action tokenizer IDs must be distinct")
+                self._pacman_action_token_ids = token_ids
+            else:
+                token_ids = token_ids.to(logits.device)
+            bits = action_mask_bits.reshape(-1).to(
+                device=logits.device, dtype=torch.uint8
             )
-            if token_ids.unique().numel() != 4:
-                raise RuntimeError("Pacman action tokenizer IDs must be distinct")
-            self._pacman_action_token_ids = token_ids
+            ids = token_ids.expand(bits.numel(), -1).clone()
+            allowed_bits = (
+                bits.unsqueeze(-1)
+                & torch.tensor(
+                    [1, 2, 4, 8], dtype=torch.uint8, device=logits.device
+                )
+            ).bool()
+            ids.masked_fill_(~allowed_bits, -1)
         else:
-            token_ids = token_ids.to(logits.device)
-
-        bits = action_mask_bits.reshape(-1).to(device=logits.device, dtype=torch.uint8)
-        if bits.numel() > logits.shape[0]:
-            raise RuntimeError("Pacman action mask is longer than actor logits")
-        if bits.numel() < logits.shape[0]:
-            bits = torch.nn.functional.pad(
-                bits, (0, logits.shape[0] - bits.numel()), value=0
+            if allowed_token_ids.ndim < 2:
+                raise RuntimeError(
+                    "Pacman option-token mask must include a token-set dimension"
+                )
+            ids = allowed_token_ids.reshape(
+                -1, allowed_token_ids.shape[-1]
+            ).to(device=logits.device, dtype=torch.long)
+            # Option masks use token_id + 1 so generic tensor padding can use
+            # zero without accidentally enabling vocabulary token 0.
+            ids = ids - 1
+        if ids.shape[0] > logits.shape[0]:
+            raise RuntimeError("Pacman token mask is longer than actor logits")
+        if ids.shape[0] < logits.shape[0]:
+            ids = torch.nn.functional.pad(
+                ids,
+                (0, 0, 0, logits.shape[0] - ids.shape[0]),
+                value=-1,
             )
-        # The workflow stores the mask on the sampled token. Shift it to the
-        # causal logit position that predicts that token.
-        bits = torch.roll(bits, shifts=-1, dims=0)
-        allowed = (
-            bits.unsqueeze(-1)
-            & torch.tensor([1, 2, 4, 8], dtype=torch.uint8, device=logits.device)
-        ).bool()
+        # The workflow stores each allowed set on the sampled token. Shift it
+        # to the causal logit position that predicts that token.
+        ids = torch.roll(ids, shifts=-1, dims=0)
+        allowed = ids.ge(0)
         active = allowed.any(dim=-1)
         if not active.any():
             return logprobs, entropy
-
-        scaled = logits.index_select(-1, token_ids).float()
+        if ids[allowed].ge(logits.shape[-1]).any():
+            raise RuntimeError("Pacman token mask contains an out-of-vocabulary ID")
+        duplicate = (
+            ids.unsqueeze(-1).eq(ids.unsqueeze(-2))
+            & allowed.unsqueeze(-1)
+            & allowed.unsqueeze(-2)
+            & ~torch.eye(
+                ids.shape[-1], dtype=torch.bool, device=ids.device
+            ).unsqueeze(0)
+        ).any(dim=(-1, -2))
+        if duplicate[active].any():
+            raise RuntimeError("Pacman token mask contains duplicate allowed IDs")
+        safe_ids = ids.clamp_min(0)
+        scaled = logits.gather(-1, safe_ids).float()
         scaled = scaled / self.config.temperature
         masked_scaled = scaled.masked_fill(~allowed, float("-inf"))
+        # Keep inactive rows finite before logsumexp. Although torch.where
+        # preserves the original output on those rows, hidden inf/NaN values
+        # can still poison autograd through the unselected branch.
+        masked_scaled = torch.where(
+            active.unsqueeze(-1),
+            masked_scaled,
+            torch.zeros_like(masked_scaled),
+        )
         denominator = torch.logsumexp(masked_scaled, dim=-1)
-        target_matches = labels.reshape(-1, 1).eq(token_ids.reshape(1, -1))
+        target_matches = labels.reshape(-1, 1).eq(ids)
         target_allowed = target_matches & allowed
         if not target_allowed[active].any(dim=-1).all():
             raise RuntimeError(
-                "sampled Pacman action token is absent from its rollout-time mask"
+                "sampled Pacman token is absent from its rollout-time mask"
             )
         target_scaled = torch.where(
             target_allowed, scaled, torch.zeros_like(scaled)
@@ -2074,15 +2128,15 @@ class FSDPEngine(TrainEngine):
         logprobs = torch.where(active, masked_logprobs, logprobs)
 
         if entropy is not None:
-            normalized = masked_scaled - denominator.unsqueeze(-1)
+            normalized = torch.where(
+                allowed,
+                masked_scaled - denominator.unsqueeze(-1),
+                torch.zeros_like(masked_scaled),
+            )
             probabilities = torch.where(
                 allowed, normalized.exp(), torch.zeros_like(normalized)
             )
-            masked_entropy = -torch.where(
-                allowed,
-                probabilities * normalized,
-                torch.zeros_like(normalized),
-            ).sum(dim=-1)
+            masked_entropy = -(probabilities * normalized).sum(dim=-1)
             entropy = torch.where(active, masked_entropy, entropy)
         return logprobs, entropy
 
@@ -2092,6 +2146,7 @@ class FSDPEngine(TrainEngine):
         inputs: dict[str, Any],
         ulysses_pad_size: int = 0,
         action_mask_bits: torch.Tensor | None = None,
+        allowed_token_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Try to get rolled_input_ids (if Ulysses SP is enabled)
         labels = inputs.get(
@@ -2113,6 +2168,7 @@ class FSDPEngine(TrainEngine):
             logits,
             labels,
             action_mask_bits,
+            allowed_token_ids,
             logprobs,
             entropy,
         )
@@ -2130,6 +2186,7 @@ class FSDPEngine(TrainEngine):
         inputs: dict[str, Any],
         ulysses_pad_size: int = 0,
         action_mask_bits: torch.Tensor | None = None,
+        allowed_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Try to get rolled_input_ids (if Ulysses SP is enabled)
         labels = inputs.get(
@@ -2151,6 +2208,7 @@ class FSDPEngine(TrainEngine):
             logits,
             labels,
             action_mask_bits,
+            allowed_token_ids,
             logprobs,
         )
         if self.parallel_helper.sp_size > 1:
@@ -2219,6 +2277,7 @@ class FSDPEngine(TrainEngine):
                     ctx.model_inputs,
                     ctx.ulysses_pad_size,
                     ctx.mb_input.get("pacman_action_mask_bits"),
+                    ctx.mb_input.get("pacman_allowed_token_ids"),
                 )
                 vocab_min_logits, vocab_max_logits = self._get_vocab_min_max_logits(
                     logits, ctx.ulysses_pad_size
@@ -2271,6 +2330,7 @@ class FSDPEngine(TrainEngine):
                 ctx.model_inputs,
                 ctx.ulysses_pad_size,
                 ctx.mb_input.get("pacman_action_mask_bits"),
+                ctx.mb_input.get("pacman_allowed_token_ids"),
             )
         else:
             result = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)

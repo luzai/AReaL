@@ -227,9 +227,21 @@ def apply_rejection_sampling(
         )
 
     # Step 1: Compute log ratio = log(π_proximal / π_behave)
+    # Active rollout tokens must always have finite probabilities. Silently
+    # replacing an active NaN/Inf with ratio=1 would keep corrupted samples and
+    # can hide an inference/training alignment failure.
+    active = loss_mask.bool()
+    active_nonfinite = active & (
+        ~torch.isfinite(proximal_logprobs) | ~torch.isfinite(old_logprobs)
+    )
+    if active_nonfinite.any().item():
+        raise ValueError(
+            "rejection sampling received non-finite active log-probabilities"
+        )
     # Upcast operands to fp32 before subtraction to avoid precision loss in bf16/fp16.
     log_ratio = proximal_logprobs.detach().float() - old_logprobs.detach().float()
-    # Sanitize non-finite values (e.g. -inf - (-inf) = NaN) to prevent NaN propagation.
+    # Inactive prompt/padding rows may legitimately contain sentinels. They do
+    # not participate in aggregation or loss, so neutralize only those values.
     log_ratio = torch.where(torch.isfinite(log_ratio), log_ratio, 0.0)
 
     # Step 2: Compute metric value (reuse existing KLEstimator sign conventions)
@@ -296,17 +308,6 @@ def apply_rejection_sampling(
                 .clamp(min=1)
             )
 
-            # Ratio metric + sequence level: use geometric mean as uniform weight
-            # for all tokens (matches old sequence_mask/sequence_truncate semantics).
-            if _use_log_agg:
-                # masked_agg is already log_ratio masked by loss_mask (computed above).
-                seq_log_sum = torch.zeros(
-                    batch_size, device=log_ratio.device, dtype=log_ratio.dtype
-                ).scatter_add_(0, sequence_idx, masked_agg)
-                seq_log_mean = seq_log_sum / valid_count_per_seq.to(log_ratio.dtype)
-                behave_imp_weight = torch.exp(seq_log_mean)[sequence_idx]
-                original_weight = behave_imp_weight
-
             if config.agg == "sum":
                 seq_agg = torch.zeros(
                     batch_size, device=metric.device, dtype=agg_values.dtype
@@ -337,6 +338,23 @@ def apply_rejection_sampling(
 
             # Convert back to metric space for threshold comparison.
             seq_metric = torch.exp(seq_agg) if _use_log_agg else seq_agg
+            if _use_log_agg:
+                # agg='sum' is the joint probability ratio of a multi-token
+                # option. Preserve the established geometric-mean correction
+                # for the other sequence aggregation modes.
+                if config.agg == "sum":
+                    correction_log_ratio = seq_agg
+                else:
+                    correction_log_ratio = (
+                        torch.zeros(
+                            batch_size,
+                            device=log_ratio.device,
+                            dtype=log_ratio.dtype,
+                        ).scatter_add_(0, sequence_idx, masked_agg)
+                        / valid_count_per_seq.to(log_ratio.dtype)
+                    )
+                behave_imp_weight = torch.exp(correction_log_ratio)[sequence_idx]
+                original_weight = behave_imp_weight
 
             # Check each sequence against bounds
             in_bounds_per_seq = _check_bounds(seq_metric, config)
@@ -361,12 +379,6 @@ def apply_rejection_sampling(
             masked_agg = torch.where(loss_mask.bool(), agg_values, 0.0)
             valid_count = loss_mask.sum(dim=-1, keepdim=True).clamp(min=1)
 
-            # Ratio metric + sequence level: geometric mean as uniform weight.
-            if _use_log_agg:
-                seq_log_mean = masked_agg.sum(dim=-1, keepdim=True) / valid_count
-                behave_imp_weight = torch.exp(seq_log_mean).expand_as(log_ratio)
-                original_weight = behave_imp_weight
-
             if config.agg == "sum":
                 seq_agg = masked_agg.sum(dim=-1, keepdim=True)
             elif config.agg == "mean":
@@ -383,6 +395,16 @@ def apply_rejection_sampling(
 
             # Convert back to metric space for threshold comparison.
             seq_metric = torch.exp(seq_agg) if _use_log_agg else seq_agg
+            if _use_log_agg:
+                correction_log_ratio = (
+                    seq_agg
+                    if config.agg == "sum"
+                    else masked_agg.sum(dim=-1, keepdim=True) / valid_count
+                )
+                behave_imp_weight = torch.exp(correction_log_ratio).expand_as(
+                    log_ratio
+                )
+                original_weight = behave_imp_weight
 
             if config.action == "mask":
                 in_bounds = _check_bounds(seq_metric, config).expand_as(loss_mask)
@@ -461,6 +483,7 @@ def ppo_actor_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    loss_reduction_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """PPO actor loss function with optional rejection sampling.
 
@@ -498,12 +521,31 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
+        loss_reduction_weights: Optional non-negative weights with the same shape as
+            ``loss_mask``. When supplied, the PPO numerator is weighted per token and
+            divided by the original weight sum. Whole-episode GRPO uses weights that
+            sum to one inside each episode, producing equal episode contribution.
     """
-    # Save original count BEFORE rejection sampling may modify loss_mask.
-    # This keeps the denominator consistent with loss_weight_fn in actor.py,
-    # which always uses the original loss_mask from input_data. Without this,
-    # mask mode would inflate per-token gradients by N_original / N_kept.
-    loss_mask_count = loss_mask.count_nonzero() or 1
+    # Save the original denominator BEFORE rejection sampling may modify loss_mask.
+    # This keeps the denominator consistent with loss_weight_fn in actor.py. Without
+    # this, mask mode would inflate gradients by original_mass / kept_mass.
+    if loss_reduction_weights is None:
+        loss_normalizer = loss_mask.count_nonzero() or 1
+    else:
+        if loss_reduction_weights.shape != loss_mask.shape:
+            raise ValueError(
+                "loss_reduction_weights must match loss_mask shape: "
+                f"weights={tuple(loss_reduction_weights.shape)} "
+                f"mask={tuple(loss_mask.shape)}"
+            )
+        loss_reduction_weights = torch.where(
+            loss_mask,
+            loss_reduction_weights.detach().to(dtype=logprobs.dtype),
+            0.0,
+        )
+        loss_normalizer = loss_reduction_weights.sum().clamp_min(
+            torch.finfo(logprobs.dtype).eps
+        )
 
     # === Apply rejection sampling (replaces old compute_behave_imp_weight) ===
     if rejection_sampling is not None:
@@ -562,7 +604,10 @@ def ppo_actor_loss_fn(
         pg_loss = pg_loss * behave_imp_weight
 
     logging_loss = pg_loss.detach()
-    pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
+    masked_pg_loss = torch.where(loss_mask, pg_loss, 0)
+    if loss_reduction_weights is not None:
+        masked_pg_loss = masked_pg_loss * loss_reduction_weights
+    pg_loss = masked_pg_loss.sum() / loss_normalizer
     clip_mask.logical_and_(loss_mask)
     dual_clip_mask.logical_and_(loss_mask)
     stat = dict(

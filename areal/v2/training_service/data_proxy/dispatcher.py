@@ -35,6 +35,7 @@ import aiohttp
 import orjson
 
 from areal.infra.controller.train_controller import (
+    _dispatch_ppo_tensors,
     _dispatch_tensors,
     _is_tensor_like,
     _merge_tensors,
@@ -80,7 +81,13 @@ class Dispatcher:
     # Fluent API
     # ------------------------------------------------------------------
 
-    def dispatch(self, path: str, *, pad_eval_batch: bool = False) -> DispatchRequest:
+    def dispatch(
+        self,
+        path: str,
+        *,
+        pad_eval_batch: bool = False,
+        uneven_ppo: bool = False,
+    ) -> DispatchRequest:
         """Return a dispatch builder for *path*.
 
         Dispatch operations route tensors via DP-aware partitioning
@@ -90,7 +97,12 @@ class Dispatcher:
         intra-group collectives) and the first DP head's response is
         returned.
         """
-        return DispatchRequest(self, path, pad_eval_batch=pad_eval_batch)
+        return DispatchRequest(
+            self,
+            path,
+            pad_eval_batch=pad_eval_batch,
+            uneven_ppo=uneven_ppo,
+        )
 
     def broadcast(self, path: str) -> BroadcastRequest:
         """Return a broadcast builder for *path*.
@@ -146,14 +158,20 @@ class DispatchRequest:
     Obtain via :meth:`Dispatcher.dispatch`.
     """
 
-    __slots__ = ("_dispatcher", "_path", "_pad_eval_batch")
+    __slots__ = ("_dispatcher", "_path", "_pad_eval_batch", "_uneven_ppo")
 
     def __init__(
-        self, dispatcher: Dispatcher, path: str, *, pad_eval_batch: bool = False
+        self,
+        dispatcher: Dispatcher,
+        path: str,
+        *,
+        pad_eval_batch: bool = False,
+        uneven_ppo: bool = False,
     ) -> None:
         self._dispatcher = dispatcher
         self._path = path
         self._pad_eval_batch = pad_eval_batch
+        self._uneven_ppo = uneven_ppo
 
     async def get(self) -> bytes:
         """GET from all DP heads, return the first response."""
@@ -191,6 +209,7 @@ class DispatchRequest:
                 raw_kwargs,
                 group_size,
                 pad_eval_batch=self._pad_eval_batch,
+                uneven_ppo=self._uneven_ppo,
             )
         return await self._scalar_fan_out(body)
 
@@ -229,6 +248,7 @@ class DispatchRequest:
         group_size: int,
         *,
         pad_eval_batch: bool,
+        uneven_ppo: bool,
     ) -> bytes:
         d = self._dispatcher
         dp_size = d._topology.dp_size
@@ -238,7 +258,7 @@ class DispatchRequest:
             raw_args = list(args_tuple)
 
         dp_args, dp_kwargs, group_indices = self._partition_inputs(
-            raw_args, raw_kwargs, group_size
+            raw_args, raw_kwargs, group_size, uneven_ppo=uneven_ppo
         )
 
         dp_head_results = await self._fan_out(dp_args, dp_kwargs)
@@ -256,6 +276,8 @@ class DispatchRequest:
         args: list[Any],
         kwargs: dict[str, Any],
         group_size: int,
+        *,
+        uneven_ppo: bool = False,
     ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]]]:
         dp_size = self._dispatcher._topology.dp_size
         group_indices: list[list[int]] | None = None
@@ -264,9 +286,16 @@ class DispatchRequest:
             nonlocal group_indices
             if _is_tensor_like(item):
                 if group_indices is None:
-                    splits, group_indices = _dispatch_tensors(
-                        item, dp_size, group_size=group_size
-                    )
+                    if uneven_ppo:
+                        if group_size != 1:
+                            raise ValueError(
+                                "uneven PPO dispatch requires group_size=1"
+                            )
+                        splits, group_indices = _dispatch_ppo_tensors(item, dp_size)
+                    else:
+                        splits, group_indices = _dispatch_tensors(
+                            item, dp_size, group_size=group_size
+                        )
                     return splits
                 return [[item[i] for i in idxs] for idxs in group_indices]
             return [item] * dp_size

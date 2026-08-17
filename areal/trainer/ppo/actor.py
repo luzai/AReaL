@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import functools
 from typing import Any
 
@@ -27,6 +28,7 @@ from areal.utils.data import (
     TrajBatchMeta,
     batched_call,
     split_padded_tensor_dict_into_mb_list,
+    tensor_container_to,
 )
 from areal.utils.functional import (
     cispo_loss_fn,
@@ -40,6 +42,309 @@ from areal.v2.training_service.controller.controller import (
 )
 
 logger = logging.getLogger("PPOActor")
+
+ROLLOUT_EPISODE_METADATA_KEYS = (
+    "rollout_episode_ids",
+    "rollout_episode_returns",
+    "rollout_episode_group_sizes",
+)
+EPISODE_LOSS_WEIGHT_KEY = "episode_loss_weights"
+
+
+def _split_ppo_batch_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Split a post-advantage PPO batch into independent sequence rows.
+
+    Tensor rows retain a leading batch dimension of one. Token-aligned tensors
+    are trimmed on axis 1 using the corresponding attention mask, including
+    vector-valued fields shaped ``[batch, sequence, width]``. Batch-aligned
+    lists (notably ``multi_modal_input``) move with the matching row.
+    """
+
+    attention_mask = data.get("attention_mask")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        raise ValueError(
+            "PPO sequence repartition requires a 2-D attention_mask, got "
+            f"{type(attention_mask).__name__}"
+        )
+    batch_size, padded_seqlen = attention_mask.shape
+    if batch_size <= 0:
+        raise ValueError("PPO sequence repartition requires a non-empty batch")
+
+    rows: list[dict[str, Any]] = []
+    for row_index in range(batch_size):
+        mask = attention_mask[row_index].bool()
+        valid_seqlen = int(mask.sum().item())
+        if valid_seqlen <= 0:
+            raise ValueError(
+                f"PPO sequence repartition found an empty row at index {row_index}"
+            )
+        if not bool(mask[:valid_seqlen].all()) or bool(mask[valid_seqlen:].any()):
+            raise ValueError(
+                "PPO sequence repartition requires right-padded attention masks; "
+                f"row {row_index} is not contiguous"
+            )
+
+        row: dict[str, Any] = {}
+        for key, value in data.items():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 1
+                and value.shape[0] == batch_size
+            ):
+                row_value = value[row_index : row_index + 1]
+                if value.ndim >= 2 and value.shape[1] == padded_seqlen:
+                    row_value = row_value[:, :valid_seqlen, ...]
+                row[key] = row_value
+            elif isinstance(value, list):
+                if len(value) != batch_size:
+                    raise ValueError(
+                        f"PPO batch list field {key!r} has length {len(value)}, "
+                        f"expected {batch_size}"
+                    )
+                row[key] = [copy.deepcopy(value[row_index])]
+            else:
+                row[key] = copy.deepcopy(value)
+        rows.append(row)
+    return rows
+
+
+def _flatten_ppo_advantage_groups(
+    grouped_rows: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Flatten worker-preserved prompt groups after advantage computation."""
+
+    if not isinstance(grouped_rows, list) or any(
+        not isinstance(group, list) for group in grouped_rows
+    ):
+        raise TypeError("PPO repartition expected list[list[dict]] worker results")
+    rows = [row for group in grouped_rows for row in group]
+    if not rows or any(not isinstance(row, dict) for row in rows):
+        raise TypeError("PPO repartition produced an empty or invalid sequence list")
+    return rows
+
+
+def _normalize_rollout_episode_returns(
+    episode_returns: torch.Tensor,
+    episode_ids: torch.Tensor,
+    expected_group_sizes: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    trajectory_group_sizes: list[int],
+    normalizer: Normalization,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize episode returns and build equal-episode token loss weights.
+
+    A grouped agent rollout can contain many model calls per episode. The leading
+    tensor dimension therefore counts decisions, not episodes. Episode IDs must be
+    contiguous inside each initial-state trajectory group; each unique episode is
+    counted once regardless of how many decisions it contains. Each episode's valid
+    tokens receive weights summing to one, so the PPO reducer averages within an
+    episode before averaging across episodes.
+    """
+    tensors = {
+        "rollout_episode_returns": episode_returns,
+        "rollout_episode_ids": episode_ids,
+        "rollout_episode_group_sizes": expected_group_sizes,
+    }
+    batch_size = episode_returns.shape[0]
+    for name, value in tensors.items():
+        if value.ndim != 1 or value.shape[0] != batch_size:
+            raise ValueError(
+                f"{name} must have shape [{batch_size}], got {tuple(value.shape)}"
+            )
+    if loss_mask.ndim != 2 or loss_mask.shape[0] != batch_size:
+        raise ValueError(
+            "whole-episode GRPO loss_mask must have shape [batch, sequence], "
+            f"got {tuple(loss_mask.shape)}"
+        )
+    if sum(trajectory_group_sizes) != batch_size:
+        raise ValueError(
+            "trajectory group sizes must cover every decision sample: "
+            f"sum={sum(trajectory_group_sizes)} batch={batch_size}"
+        )
+    if normalizer.mean_level != "group" or normalizer.std_level != "group":
+        raise ValueError(
+            "whole-episode GRPO requires group-level reward mean and std"
+        )
+
+    unique_returns: list[torch.Tensor] = []
+    sample_to_episode: list[torch.Tensor] = []
+    episode_loss_weights: list[torch.Tensor] = []
+    episode_group_sizes: list[int] = []
+    sample_offset = 0
+    episode_offset = 0
+    for decision_count in trajectory_group_sizes:
+        group_slice = slice(sample_offset, sample_offset + decision_count)
+        ids = episode_ids[group_slice]
+        returns = episode_returns[group_slice]
+        declared_sizes = expected_group_sizes[group_slice]
+        if decision_count <= 0:
+            raise ValueError("trajectory groups must contain at least one decision")
+        if not torch.all(declared_sizes == declared_sizes[0]):
+            raise ValueError("episode group-size metadata changed within one prompt")
+        expected_episodes = int(declared_sizes[0].item())
+        if expected_episodes != normalizer.group_size:
+            raise ValueError(
+                "episode group-size metadata does not match reward normalization: "
+                f"metadata={expected_episodes} norm={normalizer.group_size}"
+            )
+
+        starts = torch.ones_like(ids, dtype=torch.bool)
+        starts[1:] = ids[1:] != ids[:-1]
+        first_indices = starts.nonzero(as_tuple=False).flatten()
+        unique_ids = ids[first_indices]
+        if unique_ids.unique().numel() != unique_ids.numel():
+            raise ValueError(
+                "one rollout episode appears in multiple non-contiguous spans"
+            )
+        n_episodes = int(unique_ids.numel())
+        if n_episodes != expected_episodes:
+            raise ValueError(
+                "whole-episode GRPO requires the declared number of complete "
+                f"episodes: expected={expected_episodes} actual={n_episodes}"
+            )
+
+        local_episode_index = starts.long().cumsum(0) - 1
+        group_episode_returns = returns[first_indices]
+        if not torch.equal(
+            returns, group_episode_returns[local_episode_index]
+        ):
+            raise ValueError("episode return changed between decisions")
+        unique_returns.append(group_episode_returns)
+        sample_to_episode.append(local_episode_index + episode_offset)
+
+        group_loss_mask = loss_mask[group_slice].float()
+        episode_token_counts = torch.zeros(
+            n_episodes,
+            dtype=torch.float32,
+            device=group_loss_mask.device,
+        )
+        episode_token_counts.scatter_add_(
+            0,
+            local_episode_index,
+            group_loss_mask.sum(dim=-1),
+        )
+        if torch.any(episode_token_counts <= 0):
+            raise ValueError(
+                "every complete rollout episode must contain at least one valid token"
+            )
+        per_sample_token_weight = episode_token_counts[
+            local_episode_index
+        ].reciprocal()
+        episode_loss_weights.append(
+            group_loss_mask * per_sample_token_weight.unsqueeze(-1)
+        )
+        episode_group_sizes.append(n_episodes)
+        episode_offset += n_episodes
+        sample_offset += decision_count
+
+    normalized_unique = normalizer(
+        torch.cat(unique_returns), group_sizes=episode_group_sizes
+    )
+    return (
+        normalized_unique[torch.cat(sample_to_episode)],
+        torch.cat(episode_loss_weights),
+    )
+
+
+def _build_equal_episode_loss_weights(
+    episode_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Give every rollout episode the same total PPO loss mass.
+
+    Each valid token receives ``1 / n_valid_tokens_in_episode``. The weights
+    therefore sum to one for every episode even when episodes contain different
+    numbers of option decisions. The distributed reducer subsequently averages
+    those unit episode masses across the complete rollout batch.
+    """
+
+    if episode_ids.ndim != 1:
+        raise ValueError(
+            "rollout_episode_ids must be one-dimensional, got "
+            f"{tuple(episode_ids.shape)}"
+        )
+    if loss_mask.ndim != 2 or loss_mask.shape[0] != episode_ids.shape[0]:
+        raise ValueError(
+            "episode loss weighting requires loss_mask shape [batch, sequence]: "
+            f"ids={tuple(episode_ids.shape)} mask={tuple(loss_mask.shape)}"
+        )
+
+    unique_ids, sample_to_episode = torch.unique(
+        episode_ids, sorted=False, return_inverse=True
+    )
+    token_mask = loss_mask.float()
+    episode_token_counts = torch.zeros(
+        unique_ids.numel(), dtype=torch.float32, device=token_mask.device
+    )
+    episode_token_counts.scatter_add_(
+        0, sample_to_episode, token_mask.sum(dim=-1)
+    )
+    if torch.any(episode_token_counts <= 0):
+        raise ValueError(
+            "every rollout episode must contain at least one valid loss token"
+        )
+    return token_mask * episode_token_counts[sample_to_episode].reciprocal().unsqueeze(
+        -1
+    )
+
+
+def _actor_loss_weight(data: dict[str, Any]) -> torch.Tensor:
+    """Return the reducer mass used by both local and distributed loss scaling."""
+    episode_weights = data.get(EPISODE_LOSS_WEIGHT_KEY)
+    if episode_weights is not None:
+        return episode_weights.sum()
+    return data["loss_mask"].count_nonzero()
+
+
+def _pad_ppo_batch_to_size(
+    data: dict[str, Any], target_batch_size: int
+) -> dict[str, Any]:
+    """Append valid-forward, zero-loss rows without changing real PPO samples."""
+
+    attention_mask = data.get("attention_mask")
+    loss_mask = data.get("loss_mask")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        raise ValueError("PPO padding requires a 2-D attention_mask")
+    if not isinstance(loss_mask, torch.Tensor) or loss_mask.ndim != 2:
+        raise ValueError("PPO padding requires a 2-D loss_mask")
+
+    batch_size = attention_mask.shape[0]
+    if batch_size <= 0:
+        raise ValueError("PPO padding requires a non-empty local batch")
+    if target_batch_size < batch_size:
+        raise ValueError(
+            f"PPO padding target {target_batch_size} < local batch {batch_size}"
+        )
+    pad_count = target_batch_size - batch_size
+    if pad_count == 0:
+        return data
+
+    # Reuse the shortest real row to minimize dummy forward work. The current
+    # PPO repartition path deliberately stages this batch on CPU before RPC.
+    template_index = int(attention_mask.sum(-1).argmin().item())
+    padded = dict(data)
+    zero_mass_keys = {"loss_mask", EPISODE_LOSS_WEIGHT_KEY}
+    for key, value in data.items():
+        if (
+            isinstance(value, torch.Tensor)
+            and value.ndim >= 1
+            and value.shape[0] == batch_size
+        ):
+            template = value[template_index : template_index + 1]
+            repeats = (pad_count,) + (1,) * (value.ndim - 1)
+            padding = template.repeat(repeats)
+            if key in zero_mass_keys:
+                padding.zero_()
+            padded[key] = torch.cat((value, padding), dim=0)
+        elif isinstance(value, list) and len(value) == batch_size:
+            padded[key] = list(value) + [
+                copy.deepcopy(value[template_index]) for _ in range(pad_count)
+            ]
+
+    if padded["attention_mask"].shape[0] != target_batch_size:
+        raise RuntimeError("PPO padding did not reach the synchronized batch size")
+    return padded
 
 
 class PPOActor:
@@ -135,14 +440,30 @@ class PPOActor:
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
         self.engine.eval()
+        data = data.copy()
+        for key in ROLLOUT_EPISODE_METADATA_KEYS:
+            data.pop(key, None)
         return self.engine.forward(
             input_=data,
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
-    def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return batched_call(self._compute_advantages, data, pass_meta=True)
+    def compute_advantages(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        repartition_for_ppo: bool = False,
+    ) -> list[dict[str, Any]] | list[list[dict[str, Any]]]:
+        grouped = batched_call(self._compute_advantages, data, pass_meta=True)
+        if not repartition_for_ppo:
+            return grouped
+
+        # Stage each complete prompt group once before creating thousands of
+        # singleton views. The RPC layer can then remotize the rows without a
+        # per-field, per-row GPU-to-CPU transfer.
+        grouped = tensor_container_to(grouped, "cpu")
+        return [_split_ppo_batch_rows(group) for group in grouped]
 
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
@@ -167,22 +488,77 @@ class PPOActor:
                 max_response_length=self.config.max_new_tokens,
             )
 
+        loss_mask = data["loss_mask"].float()
+        loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
+
         # Reward Scaling
         reward_score = data["rewards"]
-        reward_score = (reward_score + self.reward_bias) * self.reward_scaling
-        reward_score = torch.clip(
-            reward_score, max=self.reward_clip, min=-self.reward_clip
+        episode_ids, episode_returns, episode_group_sizes = [
+            data.get(key) for key in ROLLOUT_EPISODE_METADATA_KEYS
+        ]
+        has_any_episode_return_metadata = (
+            episode_returns is not None or episode_group_sizes is not None
         )
+        if has_any_episode_return_metadata and not all(
+            value is not None
+            for value in (episode_ids, episode_returns, episode_group_sizes)
+        ):
+            raise ValueError(
+                "whole-episode GRPO metadata must include IDs, returns, and group sizes"
+            )
+        has_episode_return_metadata = all(
+            value is not None
+            for value in (episode_ids, episode_returns, episode_group_sizes)
+        )
+        if has_episode_return_metadata:
+            if self.reward_norm is None:
+                raise ValueError(
+                    "whole-episode GRPO metadata requires reward normalization"
+                )
+            if not torch.equal(
+                reward_score.float(), episode_returns.float()
+            ):
+                raise ValueError(
+                    "rewards must equal rollout_episode_returns before normalization"
+                )
+            reward_score = (
+                episode_returns + self.reward_bias
+            ) * self.reward_scaling
+            if meta is None:
+                raise ValueError(
+                    "whole-episode GRPO requires trajectory group metadata"
+                )
+            reward_score, episode_loss_weights = _normalize_rollout_episode_returns(
+                reward_score,
+                episode_ids,
+                episode_group_sizes,
+                loss_mask,
+                trajectory_group_sizes=meta.traj_group_sizes,
+                normalizer=self.reward_norm,
+            )
+            data[EPISODE_LOSS_WEIGHT_KEY] = episode_loss_weights
+            # Episode returns are normalized before clipping so large game-score
+            # scales cannot collapse every member of the group to reward_clip.
+            reward_score = torch.clip(
+                reward_score, max=self.reward_clip, min=-self.reward_clip
+            )
+        else:
+            if episode_ids is not None:
+                data[EPISODE_LOSS_WEIGHT_KEY] = _build_equal_episode_loss_weights(
+                    episode_ids, loss_mask
+                )
+            reward_score = (reward_score + self.reward_bias) * self.reward_scaling
+            reward_score = torch.clip(
+                reward_score, max=self.reward_clip, min=-self.reward_clip
+            )
         # Use actual trajectory group sizes when available so group-level
         # normalization handles failed/filtered rollout samples without slicing
         # across prompts. Direct calls without batched metadata keep the legacy
         # fixed-group-size behavior.
         group_sizes = meta.traj_group_sizes if meta is not None else None
-        if self.reward_norm:
+        if self.reward_norm and not has_episode_return_metadata:
             reward_score = self.reward_norm(reward_score, group_sizes=group_sizes)
 
-        loss_mask = data["loss_mask"].float()
-        loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
         # Apply the mask to log probabilities.
         if not self.config.use_decoupled_loss and self.config.recompute_logprob:
             # Overwrite logprobs produced by the inference engine
@@ -208,7 +584,16 @@ class PPOActor:
         attn_mask = data["attention_mask"]
         seqlens = attn_mask.sum(-1).long()
         seq_no_eos_mask = seqlens == attn_mask.shape[1]
-        rewards = -self.kl_ctl * self.kl_estimator(old_logp, ref_logp)
+        if self.config.kl_logprob_source == "proximal":
+            kl_policy_logp = data.get("prox_logp")
+            if kl_policy_logp is None:
+                raise ValueError(
+                    "prox_logp is required when kl_logprob_source='proximal'"
+                )
+            kl_policy_logp = kl_policy_logp * loss_mask
+        else:
+            kl_policy_logp = old_logp
+        rewards = -self.kl_ctl * self.kl_estimator(kl_policy_logp, ref_logp)
         kl_rewards = rewards.clone()
         # KL rewards at the next token after eos is zero.
         rewards[batch_indices, seqlens - 1] = 0
@@ -256,15 +641,34 @@ class PPOActor:
         data["loss_mask"] = loss_mask
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
+        for key in ROLLOUT_EPISODE_METADATA_KEYS:
+            data.pop(key, None)
 
         return data
 
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
-    def ppo_update(self, data: list[dict[str, Any]]) -> None:
-        batched_call(self._ppo_update, data, unpack=False)
+    def ppo_update(
+        self,
+        data: list[dict[str, Any]],
+        *,
+        _ppo_target_batch_size: int | None = None,
+    ) -> None:
+        batched_call(
+            functools.partial(
+                self._ppo_update,
+                target_batch_size=_ppo_target_batch_size,
+            ),
+            data,
+            unpack=False,
+        )
 
-    def _ppo_update(self, data: dict[str, Any]) -> None:
+    def _ppo_update(
+        self,
+        data: dict[str, Any],
+        *,
+        target_batch_size: int | None = None,
+    ) -> None:
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -366,6 +770,30 @@ class PPOActor:
         # Note: "versions" is kept if needed for approximation/metrics in loss function
         for key in ["rewards", "tot_rewards", "kl_rewards"]:
             data.pop(key, None)
+
+        # Synchronized sequence packing may raise its required micro-batch
+        # count to another DP rank's value. Equal row counts guarantee that
+        # every rank can form that many non-empty micro-batches, even when the
+        # post-advantage sequence total is not divisible by DP size.
+        local_batch_size = int(data["attention_mask"].shape[0])
+        synchronized_batch_size = (
+            local_batch_size
+            if target_batch_size is None
+            else int(target_batch_size)
+        )
+        if synchronized_batch_size < local_batch_size:
+            raise ValueError(
+                "PPO synchronized batch size cannot be smaller than the local "
+                f"batch: target={synchronized_batch_size} local={local_batch_size}"
+            )
+        if synchronized_batch_size > local_batch_size:
+            logger.info(
+                "PPO_SEQUENCE_PADDING local_rows=%d target_rows=%d padding_rows=%d",
+                local_batch_size,
+                synchronized_batch_size,
+                synchronized_batch_size - local_batch_size,
+            )
+        data = _pad_ppo_batch_to_size(data, synchronized_batch_size)
         # NOTE: calling engine.train() is critical to enabling gradient checkpointing
         self.engine.train()
         mb_inputs = split_padded_tensor_dict_into_mb_list(
@@ -396,7 +824,7 @@ class PPOActor:
                         use_cispo_loss=self.config.use_cispo_loss,
                         use_decoupled_loss=self.config.use_decoupled_loss,
                     ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    loss_weight_fn=_actor_loss_weight,
                 )
                 stats_tracker.scalar(**train_stat)
 
@@ -408,12 +836,16 @@ class PPOActorController(TrainController):
         )
 
     def compute_advantages(self, *args, **kwargs):
-        return self._custom_function_call(
+        repartition_for_ppo = bool(kwargs.get("repartition_for_ppo", False))
+        result = self._custom_function_call(
             "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
         )
+        if repartition_for_ppo:
+            return _flatten_ppo_advantage_groups(result)
+        return result
 
     def ppo_update(self, *args, **kwargs) -> None:
-        self._custom_function_call(
+        self._custom_ppo_function_call(
             "ppo_update", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
@@ -427,11 +859,15 @@ class PPOActorControllerV2(GatewayTrainController):
         return self._gateway_post_result("/ppo/actor/compute_logp", payload)
 
     def compute_advantages(self, *args, **kwargs):
+        repartition_for_ppo = bool(kwargs.get("repartition_for_ppo", False))
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
         }
-        return self._gateway_post_result("/ppo/actor/compute_advantages", payload)
+        result = self._gateway_post_result("/ppo/actor/compute_advantages", payload)
+        if repartition_for_ppo:
+            return _flatten_ppo_advantage_groups(result)
+        return result
 
     def ppo_update(self, *args, **kwargs) -> None:
         payload = {
@@ -468,6 +904,7 @@ def grpo_loss_fn(
     old_logp = input_data["logprobs"]
     advantages = input_data["advantages"]
     loss_mask = input_data["loss_mask"].bool()
+    episode_loss_weights = input_data.get(EPISODE_LOSS_WEIGHT_KEY)
     prox_logp_gt = input_data.get("prox_logp")  # Could be None if skipped
 
     entropy = entropy.detach()
@@ -491,6 +928,10 @@ def grpo_loss_fn(
 
     # Use CISPO, SAPO, or PPO loss
     if use_cispo_loss:
+        if episode_loss_weights is not None:
+            raise ValueError(
+                "whole-episode GRPO reduction does not support CISPO"
+            )
         if use_sapo_loss:
             raise ValueError(
                 "CISPO and SAPO are mutually exclusive surrogates. "
@@ -513,6 +954,10 @@ def grpo_loss_fn(
             cu_seqlens=input_data.get("cu_seqlens"),
         )
     elif use_sapo_loss:
+        if episode_loss_weights is not None:
+            raise ValueError(
+                "whole-episode GRPO reduction does not support SAPO"
+            )
         if use_decoupled_loss:
             raise ValueError(
                 "SAPO is not compatible with `use_decoupled_loss=True`. "
@@ -541,12 +986,17 @@ def grpo_loss_fn(
             rejection_sampling=rejection_sampling,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            loss_reduction_weights=episode_loss_weights,
         )
 
     # Joint Distillation KL Loss
     teacher_logp = input_data.get("teacher_logp")
     rkl_stat = None
     if teacher_logp is not None:
+        if episode_loss_weights is not None:
+            raise ValueError(
+                "whole-episode GRPO reduction does not support teacher loss"
+            )
         # Coefficients for RL and Knowledge Distillation
         rl_loss_weight = input_data.get("rl_loss_weight", 1.0)
         distill_loss_weight = input_data.get("distill_loss_weight", 0.005)

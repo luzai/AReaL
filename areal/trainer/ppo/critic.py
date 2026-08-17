@@ -81,7 +81,7 @@ class PPOCriticController(TrainController):
         )
 
     def ppo_update(self, *args, **kwargs):
-        self._custom_function_call(
+        self._custom_ppo_function_call(
             "ppo_update", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
