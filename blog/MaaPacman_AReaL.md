@@ -499,11 +499,14 @@ an equal-episode loss contract. Training used four prompt rows per update on one
 node and sampled at temperature 0.7. Forty-nine optimizer updates completed; the next
 cohort was rollout-only and is excluded.
 
-![Training curve and checkpoint evaluation](../assets/figures/maapacman_training_checkpoint_selection.png)
+![Stage I learning dynamics across the selected 256-step and 512-step lineage](../assets/figures/maapacman_stage1_learning_dynamics.png)
 
-*Figure 2. Mean total shaped reward per episode rose quickly and peaked at Iter16, then
-settled into a lower plateau. A separate greedy evaluation without the 256-step cap
-selected Iter16 over the latest completed checkpoint.*
+*Figure 2. The selected lineage follows Stage I-A through Iter16 and then its Stage I-B
+continuation; Stage I-A continued separately to Iter49, which is not fully plotted. Each
+point aggregates a 48-episode cohort. Because both the horizon and feedback contract
+changed at the branch, shaped-reward levels across phases are not directly comparable.
+Clear rate remains comparable across caps; lower episode counts matter only after wins
+appear.*
 
 | Checkpoint      | Mean shaped reward in its training cohort | Greedy wins on seeds 0, 1, 2 | Mean normal-pellet clear rate |
 | --------------- | ----------------------------------------: | ---------------------------: | ----------------------------: |
@@ -521,8 +524,8 @@ cleared most pellets while failing the terminal task. Neither training reward no
 Iter25 and Iter31 came from the same later 512-step continuation of Iter16. We evaluated
 them and the base model on a shared set of 50 held-out maze layouts with deterministic
 greedy decoding and a 2,000-step limit. Iter16 itself was not run on this suite, so this
-is a separate generalization study rather than an extension of Figure 2's checkpoint
-comparison.
+is a separate generalization study rather than a checkpoint curve spanning both Stage I
+phases.
 
 ![Generalization across 50 held-out mazes](../assets/figures/maapacman_real50_generalization.png)
 
