@@ -566,18 +566,36 @@ objective.
 
 ### 5.5 Qualitative trajectory demos
 
-The compact MP4s below provide qualitative examples of the trajectories above. Click a
-poster to play the full trajectory.
+The compact MP4s below provide qualitative examples of the trajectories above. Each
+GitHub-hosted player is followed by a link to the versioned MP4 in this repository.
 
-|                                               Base model · seed 0                                               |                                                    Iter16 · seed 0                                                    |                                                               Iter49 · seed 0                                                               |
-| :-------------------------------------------------------------------------------------------------------------: | :-------------------------------------------------------------------------------------------------------------------: | :-----------------------------------------------------------------------------------------------------------------------------------------: |
-| [![Base model gets stuck](../assets/demos/pacman-base-seed0-poster.png)](../assets/demos/pacman-base-seed0.mp4) | [![Iter16 clears the level](../assets/demos/pacman-iter16-seed0-poster.png)](../assets/demos/pacman-iter16-seed0.mp4) | [![Iter49 gets stuck after clearing most pellets](../assets/demos/pacman-iter49-seed0-poster.png)](../assets/demos/pacman-iter49-seed0.mp4) |
+#### Base model · seed 0
+
+<video src="https://github.com/user-attachments/assets/1df0d1c8-d2a3-4ad3-9dff-a499d5ca428c" controls width="100%" poster="../assets/demos/pacman-base-seed0-poster.png"></video>
+
+[Download the versioned MP4](../assets/demos/pacman-base-seed0.mp4)
+
+#### Iter16 · seed 0
+
+<video src="https://github.com/user-attachments/assets/e682ba54-dfb3-4b2a-8634-90ef2d3ad725" controls width="100%" poster="../assets/demos/pacman-iter16-seed0-poster.png"></video>
+
+[Download the versioned MP4](../assets/demos/pacman-iter16-seed0.mp4)
+
+#### Iter49 · seed 0
+
+<video src="https://github.com/user-attachments/assets/5fc2da42-3f37-42b1-a4fa-2b469c543917" controls width="100%" poster="../assets/demos/pacman-iter49-seed0-poster.png"></video>
+
+[Download the versioned MP4](../assets/demos/pacman-iter49-seed0.mp4)
 
 *Seed-matched checkpoint comparison on the original ghost-free benchmark maze. The base
 model and Iter49 get stuck, while Iter16 clears the level. The Iter16-versus-Iter49
 contrast makes the gap between proxy progress and terminal success directly visible.*
 
-[![Iter31 clears a held-out maze](../assets/demos/pacman-iter31-held-out-maze-poster.png)](../assets/demos/pacman-iter31-held-out-maze.mp4)
+#### Iter31 · held-out maze
+
+<video src="https://github.com/user-attachments/assets/c528cf6c-2204-4d28-8adf-af27bd9092f4" controls width="100%" poster="../assets/demos/pacman-iter31-held-out-maze-poster.png"></video>
+
+[Download the versioned MP4](../assets/demos/pacman-iter31-held-out-maze.mp4)
 
 *A representative Iter31 strict pass from the 50-maze suite: all normal pellets are
 cleared in 841 steps. Like the quantitative evaluation above, this replay uses safe mode
