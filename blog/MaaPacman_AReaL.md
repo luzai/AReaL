@@ -153,11 +153,9 @@ decision.
 
 [Download the versioned base-model MP4](../assets/demos/pacman-base-seed0.mp4)
 
-This cold-start barrier points to a curriculum-learning-like training process: introduce
-visual grounding, local action selection, and longer-horizon planning progressively
-rather than demand full-game competence from the initial policy. We use this only as the
-high-level solution direction here; the Method section describes the concrete
-scaffolding used in our experiments.
+This cold-start barrier motivates a curriculum-learning-like progression: introduce
+visual grounding, local action selection, and longer-horizon planning in stages rather
+than demand full-game competence from the initial policy.
 
 ### 3.2 Long-horizon feedback is expensive
 
@@ -206,13 +204,12 @@ Long-horizon learning raises two related but distinct questions: what learning s
 should each decision receive, and how much total optimization weight should each episode
 receive?
 
-Episode-level GRPO preserves an episode-level shaped objective. In the later
-whole-episode contract described in Section 4.5, intermediate step rewards are summed
-over the rollout episode before returns from the same initial prompt are normalized.
-GRPO therefore does not ignore intermediate rewards. The loss of information happens
-afterward: the same normalized episode-return task signal is assigned to every model
-decision in that episode. A useful move, a bad detour, and the action preceding death
-all receive the same coarse credit.
+Episode-level GRPO preserves an episode-level shaped objective: intermediate step
+rewards are summed over the rollout episode before returns from the same initial prompt
+are normalized. GRPO therefore does not ignore intermediate rewards. The loss of
+information happens afterward: the same normalized episode-return task signal is
+assigned to every model decision in that episode. A useful move, a bad detour, and the
+action preceding death all receive the same coarse credit.
 
 An immediate step reward or option-span return offers finer temporal feedback, but its
 limitation is the opposite: it is local. By itself, it neither propagates consequences
@@ -333,9 +330,9 @@ The key invariant is stronger than “apply an action mask”:
 
 ### 4.4 Reward design: learn from events, not raw score
 
-The reported Stage I runs used rewards derived from structured game events emitted by
-the environment rather than the game's raw score. In the 256-step run from Section 5.2,
-a valid executed action at step $t$ received:
+The Stage I primitive-action configurations derived rewards from structured game events
+emitted by the environment rather than the game's raw score. In the 256-step
+configuration, a valid executed action at step $t$ received:
 
 ```math
 \begin{aligned}
@@ -367,11 +364,11 @@ pellet, avoiding double payment for one event. Scaling by $c_t$ makes the guidan
 strongest late in the game, when only a few pellets remain. An invalid or unparsable
 action response instead received `-50` for that model decision and ended the episode.
 
-The later 512-step continuation that produced Iter25 and Iter31 kept the same
+The 512-step primitive-action continuation that produced Iter25 and Iter31 kept the same
 event-level reward family and fixed step cost, but used raw per-decision feedback
 without reward or advantage normalization. Ghost, death, and safety-refusal terms belong
-to later ghost-enabled training configurations; they should not be read into the
-safe-mode results in Section 5.
+to ghost-enabled training configurations; they should not be read into the ghost-free
+primitive-action results.
 
 This shaped reward is a training signal, not the success criterion. Strict level
 completion and held-out success remain the primary evaluation metrics.
@@ -432,8 +429,9 @@ The reported runs do not map to these families uniformly. Both Stage I phases us
 local, per-decision shaped feedback, but the 256-step run additionally used the
 then-current group reward normalization and batch advantage normalization. The later
 512-step continuation used raw local feedback with both normalizations disabled. Neither
-run used the whole-episode group-relative contract above. That contract was implemented
-later and exercised by the bounded Stage II validation run in Section 5.4.
+run used the whole-episode group-relative contract above. Among the reported
+experiments, only the bounded ghost-enabled option-policy validation run exercised that
+contract.
 
 ### 4.6 What AReaL provides, and what Pacman required
 
