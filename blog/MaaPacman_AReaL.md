@@ -287,8 +287,23 @@ families:
 
 Each instantiated option includes a target, first primitive action, bounded commitment,
 and safety metadata. The VLM selects one option identifier from the current
-admissible-action set. The option harness executes the corresponding primitive actions
-and stops the harness-generated high-level option when it completes or becomes invalid.
+admissible-action set; it does not emit a precomputed action list. The deterministic
+harness uses breadth-first search (BFS) over the maze topology and handcrafted safety
+checks to ground that intent into primitive moves. `COLLECT`, `AVOID`, and `ELIMINATE`
+options are capped at `min(8, d)`, `min(3, d)`, and `min(6, d)` steps, respectively,
+where `d` is the current shortest-path distance. After every environment step, the
+harness recomputes and revalidates the selected strategy and target, stopping on
+completion, invalidation, episode termination or truncation, or the commitment cap. The
+result is a bounded, revalidated action chunk rather than blind replay of a fixed route.
+
+In a separate paired in-sample evaluation snapshot covering the same 60 episode IDs for
+each of four evaluated policy versions—240 rollouts in total—37,459 fresh model
+decisions controlled 55,975 primitive environment steps, or **1.49 steps per model
+turn**. One trajectory row is one `env.step(action)`; a model turn is a row with
+`model_called=true`. The ratio stays close to one because `COLLECT` accounted for 85.9%
+of model turns and 86.6% of those chunks ended after one step. This is a descriptive
+measurement of realized option granularity in that snapshot, not a universal constant or
+a Stage II performance result.
 
 This division of labor is intentional. The option harness owns deterministic legality
 checks, route construction, and safety validation; the learned policy decides which
@@ -437,15 +452,26 @@ contract.
 
 [AReaL](https://github.com/inclusionAI/AReaL) provides the distributed RL substrate:
 asynchronous agent rollouts, PPO/GRPO optimization, inference and training workers,
-checkpointing, and multimodal multi-turn workflows.
+checkpointing, generic multi-turn agent workflows, and multimodal rollout and training
+support. Its reference examples expose the last two capabilities mostly separately: the
+multi-turn example is a text-only GSM8K retry loop, whereas `VisionRLVRWorkflow`
+performs a single image-conditioned generation per episode.
 
-The Pacman integration extends this substrate in three important ways. First, it carries
-each state's admissible-action set from rollout into actor and reference log-probability
-computation, keeping the constrained policy consistent across generation and training.
-Second, it preserves environment-episode identity through distributed batching, enabling
-equal-episode loss weighting even when trajectories have different lengths. Third, it
-adds the operational support needed for long episodes and variable-duration options, VLM
-memory pressure, checkpoint retention, and reproducible experiment records.
+MaaPacman combines these capabilities in an interactive visual-control workflow. At each
+fresh model decision, the environment renders the current game state and packages
+exactly one fresh PNG with the prompt, while the native workflow preserves the
+corresponding VLM processor outputs through rollout and training. Under the
+harness-mediated option policy, one selected option may execute several primitive
+environment steps before the next model call. The precise contract is therefore one
+fresh image per model turn, not one image per environment step.
+
+The integration also carries each state's admissible-action set from rollout into actor
+and reference log-probability computation, keeping the constrained policy consistent
+across generation and training. It preserves environment-episode identity through
+distributed batching, enabling equal-episode loss weighting even when trajectories have
+different lengths, and adds the operational support needed for long episodes,
+variable-duration options, VLM memory pressure, checkpoint retention, and reproducible
+experiment records.
 
 Together, these changes make our AReaL-based stack capable of training a Pacman agent
 with state-dependent admissible actions. The current interface remains Pacman-specific
