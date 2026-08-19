@@ -269,14 +269,9 @@ edge from the training actor to the game.
 
 ### 4.2 Harness-mediated option policy: let the model choose intent
 
-In separate prototype runs, the harness-mediated option policy completed ghost-enabled
-games. The main training and 50-maze generalization results in Sections 5.2 and 5.3,
-however, use the primitive-action policy and should not be read as results for the
-harness-mediated option policy. Section 5.4 reports a smaller rollout-only transfer
-probe followed by a bounded three-update validation run with that policy.
-
-At each decision point, the deterministic option harness instantiates a bounded set of
-state-valid, harness-generated high-level options from three predefined strategy
+Under the harness-mediated option policy, the model selects a high-level intent rather
+than an individual movement direction. At each decision point, the deterministic option
+harness instantiates a bounded set of state-valid choices from three predefined strategy
 families:
 
 - **Collect pellets:** move toward an approved pellet target;
