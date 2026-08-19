@@ -143,6 +143,16 @@ policy-gradient signal. Increasing the rollout horizon cannot repair missing vis
 grounding or planning; it may only make the same uninformative trajectories longer and
 more expensive.
 
+The seed-0 replay below gives a qualitative view of the resulting control failure. The
+original, untrained Qwen3.5-9B policy makes little useful progress and eventually
+terminates as `STUCK`. The replay illustrates the behavioral consequence of weak visual
+grounding and planning; it does not by itself isolate which component caused each bad
+decision.
+
+<video src="https://github.com/user-attachments/assets/2745b846-65d1-47a2-be22-8b79ee217ca1" controls width="100%" poster="../assets/demos/pacman-base-seed0-poster.png"></video>
+
+[Download the versioned base-model MP4](../assets/demos/pacman-base-seed0.mp4)
+
 This cold-start barrier points to a curriculum-learning-like training process: introduce
 visual grounding, local action selection, and longer-horizon planning progressively
 rather than demand full-game competence from the initial policy. We use this only as the
