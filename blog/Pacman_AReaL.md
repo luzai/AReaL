@@ -547,17 +547,28 @@ cleared most pellets while failing the terminal task. Neither training reward no
 The base-model failure is shown in Section 3.1. The following seed-matched checkpoint
 replays make the Iter16-versus-Iter49 selection gap directly visible.
 
-**Iter16 · seed 0**
-
-<video src="https://github.com/user-attachments/assets/15a7c273-3133-4650-9cb1-4be81323fb00" controls width="100%" poster="../assets/demos/pacman-iter16-seed0-poster.png"></video>
-
-[Download the versioned Iter16 MP4](../assets/demos/pacman-iter16-seed0.mp4)
-
-**Iter49 · seed 0**
-
-<video src="https://github.com/user-attachments/assets/1160f967-c7bb-4426-b5e2-1834b3138018" controls width="100%" poster="../assets/demos/pacman-iter49-seed0-poster.png"></video>
-
-[Download the versioned Iter49 MP4](../assets/demos/pacman-iter49-seed0.mp4)
+<table>
+  <tr>
+    <th width="50%">Iter16 · selected checkpoint</th>
+    <th width="50%">Iter49 · later checkpoint</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <video src="https://github.com/user-attachments/assets/15a7c273-3133-4650-9cb1-4be81323fb00" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter16-seed0-poster.png"></video>
+    </td>
+    <td valign="top">
+      <video src="https://github.com/user-attachments/assets/1160f967-c7bb-4426-b5e2-1834b3138018" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter49-seed0-poster.png"></video>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><em>Seed 0: clears the maze.</em></td>
+    <td align="center"><em>Seed 0: clears most pellets but terminates STUCK.</em></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="../assets/demos/pacman-iter16-seed0.mp4">Download Iter16 MP4</a></td>
+    <td align="center"><a href="../assets/demos/pacman-iter49-seed0.mp4">Download Iter49 MP4</a></td>
+  </tr>
+</table>
 
 *On the original ghost-free benchmark maze, Iter16 clears the level while Iter49 gets
 stuck. The contrast shows why proxy progress cannot replace terminal checkpoint
