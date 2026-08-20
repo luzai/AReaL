@@ -653,10 +653,10 @@ They use the same frozen checkpoint, seed 0, greedy decoding, open-action maskin
   </tr>
   <tr>
     <td valign="top">
-      <video src="https://github.com/user-attachments/assets/c466b581-0f7c-4cc6-8f14-bb6e0239a872" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-level1-original-poster.png"></video>
+      <video src="https://github.com/user-attachments/assets/912ae066-187a-4e7f-ae40-e42a0d396255" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-level1-original-poster.png"></video>
     </td>
     <td valign="top">
-      <video src="https://github.com/user-attachments/assets/3d43bb0d-792f-4cf1-bdde-c33bfb56614f" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-level5-held-out-poster.png"></video>
+      <video src="https://github.com/user-attachments/assets/f17cbe9e-599f-400a-a533-5945dba0fc61" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-level5-held-out-poster.png"></video>
     </td>
     <td valign="top">
       <video src="https://github.com/user-attachments/assets/9c2c173b-05c9-4b93-984c-fdea1c008f2c" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-held-out-maze-poster.png"></video>
@@ -731,13 +731,13 @@ safety refusal after 54 environment steps, with 152 normal pellets remaining. Th
 
 ##### Pre-update Iter25 control
 
-<video src="https://raw.githubusercontent.com/luzai/AReaL/refs/heads/pacman/open-action-mask/assets/demos/pacman-stage2-control-seed12-sample00.mp4" controls width="100%" poster="../assets/demos/pacman-stage2-control-seed12-sample00-poster.png"></video>
+<video src="https://github.com/user-attachments/assets/0d061873-7fea-4fdf-850d-69ca9d795c8d" controls width="100%" poster="../assets/demos/pacman-stage2-control-seed12-sample00-poster.png"></video>
 
 [Download the versioned control MP4](../assets/demos/pacman-stage2-control-seed12-sample00.mp4)
 
 ##### After optimizer update 2
 
-<video src="https://raw.githubusercontent.com/luzai/AReaL/refs/heads/pacman/open-action-mask/assets/demos/pacman-stage2-update2-seed12-sample00.mp4" controls width="100%" poster="../assets/demos/pacman-stage2-update2-seed12-sample00-poster.png"></video>
+<video src="https://github.com/user-attachments/assets/81ef8afc-2a14-407c-92e4-b1e0f44743e2" controls width="100%" poster="../assets/demos/pacman-stage2-update2-seed12-sample00-poster.png"></video>
 
 [Download the versioned Update 2 MP4](../assets/demos/pacman-stage2-update2-seed12-sample00.mp4)
 
