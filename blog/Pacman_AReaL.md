@@ -148,9 +148,11 @@ terminates as `STUCK`. The replay illustrates the behavioral consequence of weak
 grounding and planning; it does not by itself isolate which component caused each bad
 decision.
 
-<video src="https://github.com/user-attachments/assets/2745b846-65d1-47a2-be22-8b79ee217ca1" controls width="100%" poster="../assets/demos/pacman-base-seed0-poster.png"></video>
-
-[Download the versioned base-model MP4](../assets/demos/pacman-base-seed0.mp4)
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/2745b846-65d1-47a2-be22-8b79ee217ca1" controls preload="metadata" playsinline width="72%" poster="../assets/demos/pacman-base-seed0-poster.png"></video>
+  <br>
+  <a href="../assets/demos/pacman-base-seed0.mp4">Download the versioned base-model MP4</a>
+</div>
 
 This cold-start barrier motivates a curriculum-learning-like progression: introduce
 visual grounding, local action selection, and longer-horizon planning in stages rather
@@ -615,15 +617,43 @@ The scope matters: this was a **geometry/navigation evaluation in safe mode, wit
 and fruit disabled**. It is strong evidence that the learned policy transfers across
 maze layouts. It is not evidence of general ghost-aware Pacman play.
 
-**Iter31 · held-out maze**
+Three replay-audited examples make the Iter31 navigation behavior directly inspectable.
+They use the same frozen checkpoint, seed 0, greedy decoding, open-action masking, and a
+2,000-step limit.
 
-<video src="https://github.com/user-attachments/assets/9c2c173b-05c9-4b93-984c-fdea1c008f2c" controls width="100%" poster="../assets/demos/pacman-iter31-held-out-maze-poster.png"></video>
+<table>
+  <tr>
+    <th width="33%">Original Level 1</th>
+    <th width="33%">Held-out Level 5</th>
+    <th width="33%"><code>real50_l10_v01</code></th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <video src="https://raw.githubusercontent.com/luzai/AReaL/refs/heads/pacman/open-action-mask/assets/demos/pacman-iter31-level1-original.mp4" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-level1-original-poster.png"></video>
+    </td>
+    <td valign="top">
+      <video src="https://raw.githubusercontent.com/luzai/AReaL/refs/heads/pacman/open-action-mask/assets/demos/pacman-iter31-level5-held-out.mp4" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-level5-held-out-poster.png"></video>
+    </td>
+    <td valign="top">
+      <video src="https://github.com/user-attachments/assets/9c2c173b-05c9-4b93-984c-fdea1c008f2c" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-iter31-held-out-maze-poster.png"></video>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">413 steps · reward 1,907<br>score 2,320 · <strong>strict pass</strong></td>
+    <td align="center">446 steps · reward 1,924<br>score 2,370 · <strong>strict pass</strong></td>
+    <td align="center">841 steps · reward 2,799<br>score 3,640 · <strong>strict pass</strong></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="../assets/demos/pacman-iter31-level1-original.mp4">Download MP4</a></td>
+    <td align="center"><a href="../assets/demos/pacman-iter31-level5-held-out.mp4">Download MP4</a></td>
+    <td align="center"><a href="../assets/demos/pacman-iter31-held-out-maze.mp4">Download MP4</a></td>
+  </tr>
+</table>
 
-[Download the versioned Iter31 MP4](../assets/demos/pacman-iter31-held-out-maze.mp4)
-
-*This representative Iter31 strict pass clears all normal pellets in 841 steps. Like the
-quantitative evaluation above, the replay uses safe mode with ghosts and fruit
-disabled.*
+*All three replays clear every normal pellet. The Level 5 layout was isolated in a safe
+runtime slot, and `real50_l10_v01` reuses the formal 50-maze evaluation trajectory. As
+in the quantitative study, ghosts and fruit are disabled, so these videos demonstrate
+geometry and pellet-collection behavior rather than ghost-aware play.*
 
 ### 5.2 Stage II: Ghost-enabled, harness-mediated option policy
 
