@@ -403,11 +403,10 @@ pellet, avoiding double payment for one event. Scaling by $c_t$ makes the guidan
 strongest late in the game, when only a few pellets remain. An invalid or unparsable
 action response instead received `-50` for that model decision and ended the episode.
 
-The 512-step primitive-action continuation that produced Iter25 and Iter31 kept the same
-event-level reward family and fixed step cost, but used raw per-decision feedback
-without reward or advantage normalization. Ghost, death, and safety-refusal terms belong
-to ghost-enabled training configurations; they should not be read into the ghost-free
-primitive-action results.
+The Stage I-B primitive-action continuation kept the same event-level reward family and
+fixed step cost, but used raw per-decision feedback without reward or advantage
+normalization. Ghost, death, and safety-refusal terms belong to ghost-enabled training
+configurations; they should not be read into the ghost-free primitive-action results.
 
 This shaped reward is a training signal, not the success criterion. Strict level
 completion and held-out success remain the primary evaluation metrics.
@@ -419,19 +418,20 @@ contract defines how that feedback is assigned, normalized, and reduced into an 
 These are separate design choices. We organize the implemented contracts into two
 high-level families.
 
-The **local-feedback family** assigns a decision the reward from its immediate
-environment step, or, for a harness-generated high-level option, the sum over that
-option's committed execution span:
+The **temporally local-feedback family** assigns a decision the reward from its
+immediate environment step, or, for a harness-generated high-level option, the sum over
+that option's committed execution span:
 
 ```math
 R^{\text{option}}_{e,j}
 = \sum_{t\in\text{committed span}(e,j)} r_{e,t}.
 ```
 
-In its raw variant, it applies neither reward normalization nor advantage normalization.
+In its raw form, it applies neither reward normalization nor advantage normalization.
 This gives dense, temporally local feedback, but it does not propagate consequences that
-occur after the scored step or option ends. An option-span return is therefore a local
-score, not a counterfactual or state-conditioned advantage.
+occur after the scored step or option ends. Normalizing these local scores changes their
+scale or comparison batch, not the timescale at which credit is assigned. An option-span
+return is therefore a local score, not a counterfactual or state-conditioned advantage.
 
 The **episode-level group-relative family** first sums all shaped step rewards over one
 rollout episode:
@@ -464,14 +464,6 @@ reduction prevents length alone from increasing an episode's intended weight: a
 averaged within their own episode. The data pipeline preserves episode boundaries and
 encoded admissible-action sets while balancing token load across workers.
 
-The reported runs do not map to these families uniformly. Both Stage I phases used
-local, per-decision shaped feedback, but the 256-step run additionally used the
-then-current group reward normalization and batch advantage normalization. The later
-512-step continuation used raw local feedback with both normalizations disabled. Neither
-run used the whole-episode group-relative contract above. Among the reported
-experiments, only the bounded ghost-enabled option-policy validation run exercised that
-contract.
-
 ### 4.6 What AReaL provides, and what Pacman required
 
 [AReaL](https://github.com/inclusionAI/AReaL) provides the distributed RL substrate:
@@ -503,6 +495,8 @@ rather than a generic constrained-agent API.
 
 ## 5. Experimental Results
 
+### Experimental overview
+
 We followed a staged curriculum rather than train the full ghost-aware task from
 scratch. Stage I learned ghost-free primitive-action navigation in two related phases:
 Stage I-A bootstrapped the policy with a 256-step cap and selected Iter16, while Stage
@@ -510,41 +504,71 @@ I-B continued from that checkpoint with a 512-step cap and evaluated maze
 generalization. Stage II transferred the selected Stage I policy to a ghost-enabled,
 harness-mediated option policy and validated the whole-episode training path.
 
+#### Stage setup
+
+| Phase                   | Environment   | Action interface        | Initialization                | Rollout cap | Training budget                             | Decoding                     |
+| ----------------------- | ------------- | ----------------------- | ----------------------------- | ----------: | ------------------------------------------- | ---------------------------- |
+| **Stage I-A**           | Ghost-free    | One primitive direction | Base Qwen3.5-9B               |         256 | 49 updates × 48 episodes                    | `T=0.7` rollout; greedy eval |
+| **Stage I-B**           | Ghost-free    | One primitive direction | Continue from Iter16          |         512 | 48 episodes/update; total not reported here | Sampled rollout; greedy eval |
+| **Stage II probe**      | Ghost-enabled | Harness-mediated option | Base Qwen3.5-9B and Iter25    |         512 | 12 episodes/model; 0 updates                | `T=0.7`                      |
+| **Stage II validation** | Ghost-enabled | Harness-mediated option | Iter25 actor and KL reference |         512 | 3 updates × 48 episodes                     | Sampled rollout              |
+
+#### Objective and evidence
+
+| Phase                   | Feedback timescale | Training objective                      | Main evidence                      | Claim boundary                                  |
+| ----------------------- | ------------------ | --------------------------------------- | ---------------------------------- | ----------------------------------------------- |
+| **Stage I-A**           | Per decision       | Locally shaped rewards, normalized      | Iter16 selected over Iter49        | Checkpoint diagnostic, not a success-rate study |
+| **Stage I-B**           | Per decision       | Raw locally shaped rewards              | Iter25/31; 44/50 held-out mazes    | Geometry transfer in ghost-free safe mode       |
+| **Stage II probe**      | Not applicable     | None—rollout only                       | Iter25 `8/12` vs. base `2/12`      | Single-seed transfer probe, not training gain   |
+| **Stage II validation** | Whole episode      | Prompt-group-relative episode objective | Three updates completed end to end | Training-path check, not an improvement claim   |
+
+Both Stage I phases used temporally local per-decision feedback rather than the
+whole-episode group-relative objective used in the bounded Stage II validation. Here,
+“local” describes the **credit-assignment timescale**, not the observation: the model
+still receives the current maze image at every decision.
+
+For reproducibility, Stage I-A normalized the local decision rewards, whereas Stage I-B
+used them raw. This changes the scaling, not the feedback timescale; neither phase used
+episode-level GRPO.
+
 ### 5.1 Stage I: Ghost-free primitive-action navigation
 
 Both Stage I phases ask the model to perceive the maze from the current screenshot and
 choose one legal primitive direction at each decision. Stage I-B continues from the
-checkpoint selected in Stage I-A, but changes both the rollout horizon and the feedback
-normalization contract. We therefore report them as related phases, not as one causal
-learning curve.
+checkpoint selected in Stage I-A and extends the rollout horizon. We report them as
+related phases, not as one causal learning curve.
 
 #### Stage I-A: 256-step bootstrapping and checkpoint selection
 
 This phase used Qwen3.5-9B, a 256-step rollout cap, and single-token primitive-direction
-actions constrained to the directions open in the current state. Its preliminary
-training setup applied reward normalization to groups of immediate per-decision rewards
-collected from heterogeneous game states, followed by batch advantage normalization. We
-report this setup for experiment provenance, not as a recommended group-relative
-objective; it did not use the later whole-episode, equal-episode contract in Section
-4.5.
+actions constrained to the directions open in the current state. It used the temporally
+local feedback described above and did not use the whole-episode, equal-episode contract
+in Section 4.5.
 
 Each update collected 48 rollout episodes from four prompt rows with 12 episodes per
-prompt, sampled at temperature 0.7 on one 8-GPU node. Every episode in every completed
-cohort reached the 256-step cap, so terminal evaluation was necessary to distinguish a
-useful checkpoint from one with merely high shaped reward. We completed 49 optimizer
-updates. The following cohort produced rollouts but no optimizer update and is excluded.
-Terminal evaluation selected Iter16 rather than the latest checkpoint.
+prompt, sampled at temperature 0.7 on one 8-GPU node. Every rollout episode collected
+before a completed update reached the 256-step cap, so terminal evaluation was necessary
+to distinguish a useful checkpoint from one with merely high shaped reward. We completed
+49 optimizer updates. A subsequent 48-episode rollout batch was collected, but its
+optimizer update did not run and is excluded. Terminal evaluation selected Iter16 rather
+than the latest checkpoint.
 
-| Checkpoint      | Mean shaped reward in its training cohort | Greedy wins on seeds 0, 1, 2 | Mean normal-pellet clear rate |
-| --------------- | ----------------------------------------: | ---------------------------: | ----------------------------: |
-| Base Qwen3.5-9B |                                         — |                          0/3 |                          1.6% |
-| Iter16          |                                 **150.7** |                      **3/3** |                    **100.0%** |
-| Iter49          |                                     120.3 |                          0/3 |                         92.2% |
+| Checkpoint      | Mean shaped reward in its rollout batch | Greedy wins on seeds 0, 1, 2 | Mean normal-pellet clear rate |
+| --------------- | --------------------------------------: | ---------------------------: | ----------------------------: |
+| Base Qwen3.5-9B |                                       — |                          0/3 |                          1.6% |
+| Iter16          |                               **150.7** |                      **3/3** |                    **100.0%** |
+| Iter49          |                                   120.3 |                          0/3 |                         92.2% |
 
 These three deterministic replays on one maze are a checkpoint-selection diagnostic, not
-a success-rate estimate. The failure mode is nevertheless important: the latest model
-cleared most pellets while failing the terminal task. Neither training reward nor
-“percent cleared” should replace checkpoint evaluation on the actual terminal objective.
+a success-rate estimate. Iter49 retained 92.2% mean pellet clearance but recorded 0/3
+terminal wins. The later checkpoint therefore preserved much of the local shaped proxy
+without preserving terminal reliability; neither training reward nor “percent cleared”
+should replace checkpoint evaluation on the actual terminal objective.
+
+The 256-step training cap limited coverage of late-game states, but it did not impose a
+256-step execution limit. One successful Iter16 evaluation ran for 666 environment steps
+before clearing the maze. The evidence therefore supports limited late-state training
+coverage, not a general inability to act beyond 256 steps.
 
 The base-model failure is shown in Section 3.1. The following seed-matched checkpoint
 replays make the Iter16-versus-Iter49 selection gap directly visible.
@@ -586,9 +610,9 @@ normalization**. It produced Iter25 and Iter31.
 
 *Figure 2. The selected lineage follows Stage I-A through Iter16 and then its Stage I-B
 continuation; Stage I-A continued separately to Iter49, which is not fully plotted. Each
-point aggregates a 48-episode cohort. Because both the horizon and feedback contract
-changed at the branch, shaped-reward levels across phases are not directly comparable.
-Clear rate remains comparable across caps; lower episode counts matter only after wins
+point aggregates 48 rollout episodes. Because rollout caps and reward scaling differ,
+shaped-reward levels should be compared within rather than across phases. Clear rate
+remains comparable across caps; shorter mean episode length matters only after wins
 appear.*
 
 #### Held-out-maze generalization
@@ -623,9 +647,9 @@ They use the same frozen checkpoint, seed 0, greedy decoding, open-action maskin
 
 <table>
   <tr>
-    <th width="33%">Original Level 1</th>
-    <th width="33%">Held-out Level 5</th>
-    <th width="33%"><code>real50_l10_v01</code></th>
+    <th width="33%">Original maze</th>
+    <th width="33%">Held-out maze A</th>
+    <th width="33%">Held-out maze B</th>
   </tr>
   <tr>
     <td valign="top">
@@ -680,15 +704,58 @@ normalized only within each prompt group, the resulting episode signal was assig
 that episode's option decisions, and each episode received equal intended loss weight.
 All three optimizer updates completed and wrote regular model checkpoints.
 
+#### Exploratory matched post-run diagnostic
+
+We subsequently began a separate in-sample evaluation on the original Stage II training
+prompts. The planned evaluation was stopped before all four policy versions reached 144
+episodes, so we froze the available file lists and retained only the exact 60 episode
+IDs present for the pre-update control and all three updated checkpoints.
+
+| Policy version     | Normal-pellet completions | Change vs. control | Mean normal pellets remaining | Mean score | Steps per model turn | Exact McNemar `p` vs. control |
+| ------------------ | ------------------------: | -----------------: | ----------------------------: | ---------: | -------------------: | ----------------------------: |
+| Pre-update control |             21/60 (35.0%) |                  — |                          73.1 |      9,231 |                 1.47 |                             — |
+| Update 1           |             22/60 (36.7%) |            +1.7 pp |                          63.6 |     10,046 |                 1.51 |                         1.000 |
+| Update 2           |             26/60 (43.3%) |            +8.3 pp |                          46.4 |     11,169 |                 1.50 |                         0.359 |
+| Update 3           |             23/60 (38.3%) |            +3.3 pp |                          49.1 |     11,114 |                 1.50 |                         0.839 |
+
+Update 2 had the highest observed completion rate, but its paired difference from the
+control was not statistically significant. The results are an exploratory snapshot on
+training prompts, not a completed evaluation or a held-out generalization claim.
+
+#### Matched qualitative replay
+
+The following replay-audited videos use the same training-prompt specification and
+sampling slot (seed 12, sample 00). The pre-update Iter25 control terminated with a
+safety refusal after 54 environment steps, with 152 normal pellets remaining. The Update
+2 checkpoint cleared all normal pellets in 352 steps.
+
+##### Pre-update Iter25 control
+
+<video src="https://raw.githubusercontent.com/luzai/AReaL/refs/heads/pacman/open-action-mask/assets/demos/pacman-stage2-control-seed12-sample00.mp4" controls width="100%" poster="../assets/demos/pacman-stage2-control-seed12-sample00-poster.png"></video>
+
+[Download the versioned control MP4](../assets/demos/pacman-stage2-control-seed12-sample00.mp4)
+
+##### After optimizer update 2
+
+<video src="https://raw.githubusercontent.com/luzai/AReaL/refs/heads/pacman/open-action-mask/assets/demos/pacman-stage2-update2-seed12-sample00.mp4" controls width="100%" poster="../assets/demos/pacman-stage2-update2-seed12-sample00-poster.png"></video>
+
+[Download the versioned Update 2 MP4](../assets/demos/pacman-stage2-update2-seed12-sample00.mp4)
+
+These videos visualize one matched in-sample example. They do not by themselves estimate
+win-rate improvement, demonstrate held-out transfer, or establish reliable ghost
+avoidance.
+
 #### What this evidence establishes
 
 The rollout probe shows that the Stage I checkpoint can operate with the ghost-enabled,
 harness-mediated option policy without collapsing to one repeated option sequence. The
 bounded three-update validation run shows that the whole-episode constrained-policy
-training path executes end to end. It is still not a long Stage II learning curve, a
-multi-seed improvement estimate, or evidence of general ghost avoidance. In particular,
-normal-pellet completion should not be silently equated with every possible full-game
-objective.
+training path executes end to end. Update 2 had a higher observed completion rate in the
+exploratory paired snapshot, but its paired difference from the control was not
+statistically significant. The matched videos make one behavioral contrast inspectable.
+This is still not a long Stage II learning curve, a multi-seed improvement estimate, or
+evidence of general ghost avoidance. In particular, normal-pellet completion should not
+be silently equated with every possible full-game objective.
 
 ## 6. Insights
 
@@ -697,20 +764,27 @@ objective.
 Iter16 beat Iter49 on the terminal evaluation even though Iter49 still had a high shaped
 reward and 92.2% mean pellet clearance. Long agent runs therefore need immutable
 periodic checkpoints and a fixed selection suite. “Latest” and “best” are different
-concepts.
+concepts. The result is consistent with later updates preserving a local shaped proxy
+without preserving terminal reliability. Limited late-episode credit and state coverage
+are plausible contributors, but this experiment does not isolate either mechanism or
+establish convergence to a local optimum.
 
 ### 6.2 Reward normalization is an objective contract, not a tuning switch
 
 Reward aggregation determines both which trajectories are compared and the timescale at
-which credit is assigned. We distinguish five formulations:
+which credit is assigned. We distinguish four deliberate formulations:
 
-| Formulation                                  | Effect on credit and episode weight                                                                                                                                                                                                                                     | Evidence status                                                                         |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| **Per-decision group normalization**         | Centers and scales immediate rewards from many game states together. Rare events can be amplified, but the comparison is not state-conditioned; token-flat reduction can give longer episodes more weight                                                               | Used by Stage I-A in Section 5.1                                                        |
-| **Raw per-decision feedback**                | Preserves the absolute shaping scale and local timing, but is scale-sensitive, does not propagate delayed consequences, and retains token-flat length weighting                                                                                                         | Used by the 512-step continuation behind Iter25 and Iter31                              |
-| **Whole-episode group normalization**        | Normalizes 12 full collected rollout-episode returns from the same prompt and broadcasts one episode signal to every decision; preserves the episode objective but gives coarse temporal credit, and identical group returns yield no group-relative task-return signal | Used by the bounded three-update Stage II validation run; no long-run improvement claim |
-| **Raw option-span feedback**                 | Sums reward over one executed harness-generated high-level option; more local than an episode return, but is not a counterfactual or state-conditioned advantage estimate                                                                                               | Implemented for the harness-mediated option policy; not compared in Section 5           |
-| **Episode objective with a local auxiliary** | Keeps the episode objective primary while adding clipped option-local feedback; may combine both timescales but introduces a gradient-balancing problem                                                                                                                 | Future proposal; not implemented or trained                                             |
+| Formulation                                  | Effect on credit and episode weight                                                                                                                                                                                                                                     | Evidence status                                                                           |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| **Temporally local per-decision feedback**   | Assigns immediate shaped rewards to decisions; may be raw or normalized, but does not propagate consequences that occur later in the episode                                                                                                                            | Used by both Stage I phases; scaling differed, timescale matched                          |
+| **Whole-episode group normalization**        | Normalizes 12 full collected rollout-episode returns from the same prompt and broadcasts one episode signal to every decision; preserves the episode objective but gives coarse temporal credit, and identical group returns yield no group-relative task-return signal | Used by the bounded Stage II validation run in Section 5.2; no long-run improvement claim |
+| **Raw option-span feedback**                 | Sums reward over one executed harness-generated high-level option; more local than an episode return, but is not a counterfactual or state-conditioned advantage estimate                                                                                               | Implemented for the harness-mediated option policy; not compared in the reported results  |
+| **Episode objective with a local auxiliary** | Keeps the episode objective primary while adding clipped option-local feedback; may combine both timescales but introduces a gradient-balancing problem                                                                                                                 | Future proposal; not implemented or trained                                               |
+
+For provenance, Stage I-A normalized immediate rewards collected from heterogeneous game
+states, while Stage I-B used raw per-decision rewards. That distinction affects scaling,
+not the credit-assignment timescale, and neither setup is an episode-level GRPO
+objective.
 
 These formulations have not been compared in a controlled ablation. Existing runs differ
 in checkpoint, horizon, and other settings, so they do not support a causal “normalized
@@ -761,9 +835,9 @@ present implementation or evidence, rather than part of the task definition:
 1. **Matched checkpoint coverage:** evaluate Iter16, Iter25, and Iter31 on the same
    50-maze suite; the current evidence does not show whether Iter16 would generalize
    better than the later checkpoints.
-1. **A controlled reward-contract study:** compare per-decision feedback, whole-episode
-   normalization, raw option-span feedback, and any future auxiliary objective under a
-   matched budget.
+1. **A controlled reward-contract study:** compare raw per-decision feedback,
+   whole-episode normalization, raw option-span feedback, and any future auxiliary
+   objective under a matched budget.
 1. **A multi-timescale objective:** keep the episode loss primary while adding a small,
    bounded local auxiliary alongside KL regularization. The first study should use a
    fixed local-loss coefficient with matched ablations. A later version could adapt that
