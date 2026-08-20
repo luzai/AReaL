@@ -501,60 +501,37 @@ rather than a generic constrained-agent API.
 
 ## 5. Experimental Results
 
-### 5.1 Experimental blueprint
-
 We followed a staged curriculum rather than train the full ghost-aware task from
-scratch:
+scratch. Stage I learned ghost-free primitive-action navigation in two related phases:
+Stage I-A bootstrapped the policy with a 256-step cap and selected Iter16, while Stage
+I-B continued from that checkpoint with a 512-step cap and evaluated maze
+generalization. Stage II transferred the selected Stage I policy to a ghost-enabled,
+harness-mediated option policy and validated the whole-episode training path.
 
-```text
-Stage I-A: ghost-free primitive actions, 256-step cap
-    → diagnose visual grounding and local navigation; select Iter16
-Stage I-B: ghost-free primitive actions, 512-step cap
-    → continue Iter16; select Iter25 and Iter31; test maze generalization
-Stage II: ghost-enabled, harness-mediated option policy
-    → transfer Iter25 in a rollout-only probe
-    → run a bounded three-update whole-episode GRPO validation
-```
+### 5.1 Stage I: Ghost-free primitive-action navigation
 
-Stage I-A isolates the first capabilities the agent needs: perceive the maze from the
-current screenshot, choose a legal direction, and make locally reasonable progress
-toward pellets without dynamic ghost hazards. The 256-step cap kept early diagnosis
-bounded, but every completed training episode reached that cap; terminal evaluation was
-therefore needed to distinguish a useful checkpoint from one with merely high shaped
-reward. This evaluation selected Iter16 rather than the latest checkpoint.
+Both Stage I phases ask the model to perceive the maze from the current screenshot and
+choose one legal primitive direction at each decision. Stage I-B continues from the
+checkpoint selected in Stage I-A, but changes both the rollout horizon and the feedback
+normalization contract. We therefore report them as related phases, not as one causal
+learning curve.
 
-Stage I-B resumed Iter16 with the same ghost-free primitive-action policy and raised the
-cap to 512 steps, giving the policy more room to turn local navigation into full-maze
-progress. This continuation produced Iter25 and Iter31, which were then evaluated across
-held-out maze layouts. Stage II transferred Iter25 to the harness-mediated option policy
-in a ghost-enabled environment. The task changed from choosing every direction to
-choosing among harness-generated high-level options for collecting pellets, avoiding
-danger, or pursuing an edible ghost. We first tested the transferred checkpoint without
-training, then ran three bounded updates with the episode-level objective from Section
-4.5. This final stage tests a harder action abstraction and environment; it is not part
-of the Stage I learning curve.
+#### Stage I-A: 256-step bootstrapping and checkpoint selection
 
-### 5.2 Training dynamics and checkpoint selection
+This phase used Qwen3.5-9B, a 256-step rollout cap, and single-token primitive-direction
+actions constrained to the directions open in the current state. Its preliminary
+training setup applied reward normalization to groups of immediate per-decision rewards
+collected from heterogeneous game states, followed by batch advantage normalization. We
+report this setup for experiment provenance, not as a recommended group-relative
+objective; it did not use the later whole-episode, equal-episode contract in Section
+4.5.
 
-The training run used Qwen3.5-9B, a 256-step rollout cap, and single-token
-primitive-direction actions constrained to the directions open in the current state. For
-each prompt row, immediate decision rewards from 12 rollout episodes were flattened and
-group-normalized; advantages were then normalized across the batch, and PPO was reduced
-over trained action tokens. This run did not use the later whole-episode, equal-episode
-contract in Section 4.5. All 48 episodes in every completed cohort reached the 256-step
-cap, so they happened to contribute the same number of action tokens; this was still not
-an equal-episode loss contract. Training used four prompt rows per update on one 8-GPU
-node and sampled at temperature 0.7. Forty-nine optimizer updates completed; the next
-cohort was rollout-only and is excluded.
-
-![Stage I learning dynamics across the selected 256-step and 512-step lineage](../assets/figures/maapacman_stage1_learning_dynamics.png)
-
-*Figure 2. The selected lineage follows Stage I-A through Iter16 and then its Stage I-B
-continuation; Stage I-A continued separately to Iter49, which is not fully plotted. Each
-point aggregates a 48-episode cohort. Because both the horizon and feedback contract
-changed at the branch, shaped-reward levels across phases are not directly comparable.
-Clear rate remains comparable across caps; lower episode counts matter only after wins
-appear.*
+Each update collected 48 rollout episodes from four prompt rows with 12 episodes per
+prompt, sampled at temperature 0.7 on one 8-GPU node. Every episode in every completed
+cohort reached the 256-step cap, so terminal evaluation was necessary to distinguish a
+useful checkpoint from one with merely high shaped reward. We completed 49 optimizer
+updates. The following cohort produced rollouts but no optimizer update and is excluded.
+Terminal evaluation selected Iter16 rather than the latest checkpoint.
 
 | Checkpoint      | Mean shaped reward in its training cohort | Greedy wins on seeds 0, 1, 2 | Mean normal-pellet clear rate |
 | --------------- | ----------------------------------------: | ---------------------------: | ----------------------------: |
@@ -567,13 +544,46 @@ a success-rate estimate. The failure mode is nevertheless important: the latest 
 cleared most pellets while failing the terminal task. Neither training reward nor
 “percent cleared” should replace checkpoint evaluation on the actual terminal objective.
 
-### 5.3 Generalization across 50 maze layouts
+The base-model failure is shown in Section 3.1. The following seed-matched checkpoint
+replays make the Iter16-versus-Iter49 selection gap directly visible.
 
-Iter25 and Iter31 came from the same later 512-step continuation of Iter16. We evaluated
-them and the base model on a shared set of 50 held-out maze layouts with deterministic
-greedy decoding and a 2,000-step limit. Iter16 itself was not run on this suite, so this
-is a separate generalization study rather than a checkpoint curve spanning both Stage I
-phases.
+**Iter16 · seed 0**
+
+<video src="https://github.com/user-attachments/assets/15a7c273-3133-4650-9cb1-4be81323fb00" controls width="100%" poster="../assets/demos/pacman-iter16-seed0-poster.png"></video>
+
+[Download the versioned Iter16 MP4](../assets/demos/pacman-iter16-seed0.mp4)
+
+**Iter49 · seed 0**
+
+<video src="https://github.com/user-attachments/assets/1160f967-c7bb-4426-b5e2-1834b3138018" controls width="100%" poster="../assets/demos/pacman-iter49-seed0-poster.png"></video>
+
+[Download the versioned Iter49 MP4](../assets/demos/pacman-iter49-seed0.mp4)
+
+*On the original ghost-free benchmark maze, Iter16 clears the level while Iter49 gets
+stuck. The contrast shows why proxy progress cannot replace terminal checkpoint
+selection.*
+
+#### Stage I-B: 512-step continuation and learning dynamics
+
+This phase continued from the selected Iter16 checkpoint, raised the rollout cap to 512
+steps, and used **raw per-decision feedback, with neither reward nor advantage
+normalization**. It produced Iter25 and Iter31.
+
+![Stage I learning dynamics across the selected 256-step and 512-step lineage](../assets/figures/maapacman_stage1_learning_dynamics.png)
+
+*Figure 2. The selected lineage follows Stage I-A through Iter16 and then its Stage I-B
+continuation; Stage I-A continued separately to Iter49, which is not fully plotted. Each
+point aggregates a 48-episode cohort. Because both the horizon and feedback contract
+changed at the branch, shaped-reward levels across phases are not directly comparable.
+Clear rate remains comparable across caps; lower episode counts matter only after wins
+appear.*
+
+#### Held-out-maze generalization
+
+We evaluated Iter25, Iter31, and the base model on a shared set of 50 held-out maze
+layouts with deterministic greedy decoding and a 2,000-step limit. Iter16 itself was not
+run on this suite, so this is a separate generalization study rather than a single
+checkpoint curve spanning both Stage I phases.
 
 ![Generalization across 50 held-out mazes](../assets/figures/maapacman_real50_generalization.png)
 
@@ -594,13 +604,32 @@ The scope matters: this was a **geometry/navigation evaluation in safe mode, wit
 and fruit disabled**. It is strong evidence that the learned policy transfers across
 maze layouts. It is not evidence of general ghost-aware Pacman play.
 
-### 5.4 Transfer and bounded training with the ghost-enabled, harness-mediated option policy
+**Iter31 · held-out maze**
 
-We next loaded Iter25 into the Stage II harness-mediated option policy without
-performing another PPO update. In one matched probe at seed 2 and temperature 0.7, each
-model ran 12 episodes with a 512-step cap. Iter25 completed the normal-pellet objective
-in `8/12` episodes, compared with `2/12` for the original Qwen3.5-9B model. Both
-produced `12/12` unique option paths in this sample.
+<video src="https://github.com/user-attachments/assets/9c2c173b-05c9-4b93-984c-fdea1c008f2c" controls width="100%" poster="../assets/demos/pacman-iter31-held-out-maze-poster.png"></video>
+
+[Download the versioned Iter31 MP4](../assets/demos/pacman-iter31-held-out-maze.mp4)
+
+*This representative Iter31 strict pass clears all normal pellets in 841 steps. Like the
+quantitative evaluation above, the replay uses safe mode with ghosts and fruit
+disabled.*
+
+### 5.2 Stage II: Ghost-enabled, harness-mediated option policy
+
+Stage II changes both the environment and the decision interface. Ghosts are enabled,
+and instead of choosing every primitive direction, the model selects among
+harness-generated high-level options for collecting pellets, avoiding danger, or
+pursuing an edible ghost.
+
+#### Rollout-only transfer probe
+
+We first loaded Iter25 into this policy without performing another PPO update. In one
+matched probe at seed 2 and temperature 0.7, each model ran 12 episodes with a 512-step
+cap. Iter25 completed the normal-pellet objective in `8/12` episodes, compared with
+`2/12` for the original Qwen3.5-9B model. Both produced `12/12` unique option paths in
+this sample.
+
+#### Bounded training-path validation
 
 We then initialized both the actor and frozen KL reference from the immutable Iter25
 checkpoint and created a fresh optimizer for a bounded three-update validation run. Each
@@ -610,6 +639,8 @@ normalized only within each prompt group, the resulting episode signal was assig
 that episode's option decisions, and each episode received equal intended loss weight.
 All three optimizer updates completed and wrote regular model checkpoints.
 
+#### What this evidence establishes
+
 The rollout probe shows that the Stage I checkpoint can operate with the ghost-enabled,
 harness-mediated option policy without collapsing to one repeated option sequence. The
 bounded three-update validation run shows that the whole-episode constrained-policy
@@ -617,43 +648,6 @@ training path executes end to end. It is still not a long Stage II learning curv
 multi-seed improvement estimate, or evidence of general ghost avoidance. In particular,
 normal-pellet completion should not be silently equated with every possible full-game
 objective.
-
-### 5.5 Qualitative trajectory demos
-
-The compact MP4s below provide qualitative examples of the trajectories above. Each
-GitHub-hosted player is followed by a link to the versioned MP4 in this repository.
-
-#### Base model · seed 0
-
-<video src="https://github.com/user-attachments/assets/2745b846-65d1-47a2-be22-8b79ee217ca1" controls width="100%" poster="../assets/demos/pacman-base-seed0-poster.png"></video>
-
-[Download the versioned MP4](../assets/demos/pacman-base-seed0.mp4)
-
-#### Iter16 · seed 0
-
-<video src="https://github.com/user-attachments/assets/15a7c273-3133-4650-9cb1-4be81323fb00" controls width="100%" poster="../assets/demos/pacman-iter16-seed0-poster.png"></video>
-
-[Download the versioned MP4](../assets/demos/pacman-iter16-seed0.mp4)
-
-#### Iter49 · seed 0
-
-<video src="https://github.com/user-attachments/assets/1160f967-c7bb-4426-b5e2-1834b3138018" controls width="100%" poster="../assets/demos/pacman-iter49-seed0-poster.png"></video>
-
-[Download the versioned MP4](../assets/demos/pacman-iter49-seed0.mp4)
-
-*Seed-matched checkpoint comparison on the original ghost-free benchmark maze. The base
-model and Iter49 get stuck, while Iter16 clears the level. The Iter16-versus-Iter49
-contrast makes the gap between proxy progress and terminal success directly visible.*
-
-#### Iter31 · held-out maze
-
-<video src="https://github.com/user-attachments/assets/9c2c173b-05c9-4b93-984c-fdea1c008f2c" controls width="100%" poster="../assets/demos/pacman-iter31-held-out-maze-poster.png"></video>
-
-[Download the versioned MP4](../assets/demos/pacman-iter31-held-out-maze.mp4)
-
-*A representative Iter31 strict pass from the 50-maze suite: all normal pellets are
-cleared in 841 steps. Like the quantitative evaluation above, this replay uses safe mode
-with ghosts and fruit disabled.*
 
 ## 6. Insights
 
@@ -671,7 +665,7 @@ which credit is assigned. We distinguish five formulations:
 
 | Formulation                                  | Effect on credit and episode weight                                                                                                                                                                                                                                     | Evidence status                                                                         |
 | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| **Per-decision group normalization**         | Centers and scales immediate rewards from many game states together. Rare events can be amplified, but the comparison is not state-conditioned; token-flat reduction can give longer episodes more weight                                                               | Used by the 256-step run in Section 5.2                                                 |
+| **Per-decision group normalization**         | Centers and scales immediate rewards from many game states together. Rare events can be amplified, but the comparison is not state-conditioned; token-flat reduction can give longer episodes more weight                                                               | Used by Stage I-A in Section 5.1                                                        |
 | **Raw per-decision feedback**                | Preserves the absolute shaping scale and local timing, but is scale-sensitive, does not propagate delayed consequences, and retains token-flat length weighting                                                                                                         | Used by the 512-step continuation behind Iter25 and Iter31                              |
 | **Whole-episode group normalization**        | Normalizes 12 full collected rollout-episode returns from the same prompt and broadcasts one episode signal to every decision; preserves the episode objective but gives coarse temporal credit, and identical group returns yield no group-relative task-return signal | Used by the bounded three-update Stage II validation run; no long-run improvement claim |
 | **Raw option-span feedback**                 | Sums reward over one executed harness-generated high-level option; more local than an episode return, but is not a counterfactual or state-conditioned advantage estimate                                                                                               | Implemented for the harness-mediated option policy; not compared in Section 5           |
