@@ -173,7 +173,7 @@ log-probability costs. Model offloading, memory-aware batching, distributed traj
 processing, and checkpoint retention are therefore part of the training design, not
 optional infrastructure polish.
 
-### 3.3 Admissible-action mismatch mis-specifies PPO ratios
+### 3.3 Mismatched action constraints mis-specify PPO ratios
 
 At decision `t`, let `A_t = A(s_t) ⊆ V` be the recorded state-dependent
 admissible-action set. Constrained decoding makes the vLLM rollout distribution a
