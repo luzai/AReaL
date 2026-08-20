@@ -157,27 +157,24 @@ This cold-start barrier motivates a curriculum-learning-like progression: introd
 visual grounding, local action selection, and longer-horizon planning in stages rather
 than demand full-game competence from the initial policy.
 
-### 3.2 Experimental feedback arrives slowly
+### 3.2 Slow iteration under a fixed GPU budget
 
-Consider the 256-step run: it completed 49 optimizer updates, each requiring 48 rollout
-episodes. From the first Iter1 rollout to the last Iter49 rollout, collecting these
-episodes with interleaved optimization spanned 46.21 hours in total. A 50th rollout
-batch is excluded because its optimizer update did not run.
+Consider an experimental run with 49 optimizer updates, each requiring 48 rollout
+episodes. From the first rollout of Iter1 to the last rollout of Iter49, the end-to-end
+process—including the optimizer updates performed between rollout batches—took 46.21
+hours.
 
-If the architecture or experimental design contains a subtle bug, we may have to wait
-many hours for the learning curve to expose it—after substantial compute has already
-been spent.
+If the architecture or experimental design contains a subtle bug, the learning curve may
+not reveal it for many hours, by which point substantial compute has already been spent.
 
-### 3.3 The full training loop must fit within a limited GPU budget
+That slow feedback loop must also fit within a fixed systems budget. On our single 8-GPU
+node, the vLLM rollout engine, FSDP actor, and optional reference model share the
+available compute and memory. Long rollout episodes also increase trajectory-storage and
+log-probability costs. Model offloading, memory-aware batching, distributed trajectory
+processing, and checkpoint retention are therefore part of the training design, not
+optional infrastructure polish.
 
-Training a game agent requires more than hosting one model. On our single 8-GPU node,
-the vLLM rollout engine, FSDP actor, and optional reference model must collectively fit
-within a fixed compute and memory budget. Long rollout episodes further increase the
-cost of trajectory storage and log-probability computation. Model offloading,
-memory-aware batching, distributed trajectory processing, and checkpoint retention are
-therefore part of the training design, not optional infrastructure polish.
-
-### 3.4 Rollout and training must use the same admissible-action set
+### 3.3 Rollout and training must use the same admissible-action set
 
 At decision `t`, the environment under the primitive-action policy, or the deterministic
 option harness under the harness-mediated option policy, constructs `A(s_t)`. Rollout
@@ -195,7 +192,7 @@ generated action through distributed trajectory processing into policy evaluatio
 actor and, when enabled, the reference model must each renormalize their own logits over
 exactly that recorded set using the same temperature.
 
-### 3.5 Credit assignment has two axes: timescale and episode weight
+### 3.4 Credit assignment has two axes: timescale and episode weight
 
 Long-horizon learning raises two related but distinct questions: what learning signal
 should each decision receive, and how much total optimization weight should each episode
