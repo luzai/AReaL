@@ -526,10 +526,12 @@ terminal wins. The later checkpoint therefore preserved much of the local shaped
 without preserving terminal reliability; neither training reward nor “percent cleared”
 should replace checkpoint evaluation on the actual terminal objective.
 
-The 256-step training cap limited coverage of late-game states, but it did not impose a
-256-step execution limit. One successful Iter16 evaluation ran for 666 environment steps
-before clearing the maze. The evidence therefore supports limited late-state training
-coverage, not a general inability to act beyond 256 steps.
+The 256-step cap applied only when collecting rollouts for training: each training
+episode was truncated after 256 environment steps, limiting exposure to late-game
+states. Evaluation did not use this 256-step cap, so the policy could continue acting
+past step 256 until the episode ended. For example, one successful Iter16 evaluation
+cleared the maze after 666 environment steps. The evidence therefore supports limited
+late-state coverage during training, not a general inability to act beyond 256 steps.
 
 The base-model failure is shown in Section 3.1. The following seed-matched checkpoint
 replays make the Iter16-versus-Iter49 selection gap directly visible.
