@@ -282,43 +282,24 @@ hand-coded Pacman solver.
 ### 4.3 Constraint alignment across rollout and training
 
 At decision `t`, let `A_t = A(s_t) ⊆ V` be the recorded state-dependent
-admissible-action set, and let `𝒱_tok` denote the model's full tokenizer vocabulary. At
-temperature `T`, with no additional nucleus truncation, the constrained policy is the
-model distribution renormalized over `A_t`:
+admissible-action set. Constrained decoding renormalizes the rollout policy over `A_t`
+at temperature `T`. [AReaL's decoupled PPO objective](https://arxiv.org/abs/2505.24298)
+distinguishes the vLLM rollout behavior policy `π_behav`, the pre-update proximal policy
+`π_prox`, and the current actor policy `π_θ` before applying the
+[clipped PPO update](https://arxiv.org/abs/1707.06347). The behavior-correction ratio
+directly tests whether rollout and training score the recorded choice consistently:
 
 ```math
-\pi_\theta(a \mid s_t, A_t)
-= \frac{\exp(z_\theta(a,s_t)/T)}
-{\sum_{a'\in A_t} \exp(z_\theta(a',s_t)/T)},
-\qquad a\in A_t.
+w_t = \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,A_t;T)}
+           {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t;T)}.
 ```
 
-[AReaL's decoupled PPO objective](https://arxiv.org/abs/2505.24298) distinguishes the
-vLLM rollout behavior policy `π_behav`, the pre-update proximal policy `π_prox`, and the
-current actor policy `π_θ`. Its behavior correction and
-[clipped PPO probability ratio](https://arxiv.org/abs/1707.06347) are
+When the behavior and proximal parameters match, consistent normalization gives
+`w_t = 1`. If rollout and training instead use different admissible-action sets or
+temperatures, the ratio can deviate from one even when the model parameters match. This
+is a normalization error, not policy staleness: it creates spurious importance weights,
+can reject or clip valid samples, and sends gradient into inadmissible logits.
 
-```math
-w_t = \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}
-           {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)},
-\qquad
-r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t,A_t)}
-                   {\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}.
-```
-
-Every probability in these ratios must use the same recorded `A_t` and temperature. If
-rollout sampling is normalized over `A_t` but the FSDP actor computes `π_prox` over the
-full tokenizer vocabulary `𝒱_tok`, then even matching model parameters give
-
-```math
-\widetilde{w}_t
-= \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,\mathcal V_{\mathrm{tok}})}
-       {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)}
-= \frac{Z_{A_t}}{Z_{\mathcal V_{\mathrm{tok}}}} \neq 1.
-```
-
-This is a normalization error, not policy staleness. It creates spurious importance
-weights, can reject or clip valid samples, and sends gradient into inadmissible logits.
 [Huang and Ontañón](https://arxiv.org/abs/2006.14171) study the analogous case of
 sampling from a masked distribution while computing policy-gradient updates from the
 unmasked distribution, which they call **naive invalid action masking**. In their PPO
@@ -336,8 +317,7 @@ it evaluates `log π_θ`. Neither operation decodes. Both renormalize the actor'
 over the recorded `A_t`. When KL regularization is enabled, the reference policy `π_ref`
 uses the same set and temperature, although it is not a denominator of the PPO ratio.
 These distributions need not be equal because their parameters or versions may differ;
-their admissible-action set and normalization rule must match. If `|A_t| = 1`, the
-constrained probability is one and the log-probability is zero.
+their admissible-action set and normalization rule must match.
 
 The key invariant is stronger than “apply an action mask”:
 
