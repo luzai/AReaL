@@ -518,17 +518,28 @@ Update 2 的观测完成率最高，但其与对照之间的配对差异没有�
 下面经回放审计的视频使用相同的训练提示词规范和采样槽位（种子 12，样本 00）。更新前 Iter25 对照在 54 个环境步后因安全拒绝而终止，当时剩余 152
 个普通豆子。Update 2 检查点在 352 步内清除了全部普通豆子。
 
-##### 更新前 Iter25 对照
-
-<video src="https://github.com/user-attachments/assets/0d061873-7fea-4fdf-850d-69ca9d795c8d" controls width="100%" poster="../assets/demos/pacman-stage2-control-seed12-sample00-poster.png"></video>
-
-[下载已纳入版本控制的对照 MP4](../assets/demos/pacman-stage2-control-seed12-sample00.mp4)
-
-##### 优化器 Update 2 后
-
-<video src="https://github.com/user-attachments/assets/81ef8afc-2a14-407c-92e4-b1e0f44743e2" controls width="100%" poster="../assets/demos/pacman-stage2-update2-seed12-sample00-poster.png"></video>
-
-[下载已纳入版本控制的 Update 2 MP4](../assets/demos/pacman-stage2-update2-seed12-sample00.mp4)
+<table>
+  <tr>
+    <th width="50%">更新前 Iter25 对照</th>
+    <th width="50%">优化器 Update 2 后</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <video src="https://github.com/user-attachments/assets/0d061873-7fea-4fdf-850d-69ca9d795c8d" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-stage2-control-seed12-sample00-poster.png"></video>
+    </td>
+    <td valign="top">
+      <video src="https://github.com/user-attachments/assets/81ef8afc-2a14-407c-92e4-b1e0f44743e2" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-stage2-update2-seed12-sample00-poster.png"></video>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">54 个环境步 · 安全拒绝<br>剩余 152 个普通豆子</td>
+    <td align="center">352 个环境步<br><strong>清除全部普通豆子</strong></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="../assets/demos/pacman-stage2-control-seed12-sample00.mp4">下载对照 MP4</a></td>
+    <td align="center"><a href="../assets/demos/pacman-stage2-update2-seed12-sample00.mp4">下载 Update 2 MP4</a></td>
+  </tr>
+</table>
 
 这些视频将一个匹配的样本内示例可视化。仅凭它们无法估计胜率提升、证明留出迁移或确立可靠的幽灵规避能力。
 

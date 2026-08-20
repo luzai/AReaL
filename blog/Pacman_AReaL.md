@@ -729,17 +729,28 @@ sampling slot (seed 12, sample 00). The pre-update Iter25 control terminated wit
 safety refusal after 54 environment steps, with 152 normal pellets remaining. The Update
 2 checkpoint cleared all normal pellets in 352 steps.
 
-##### Pre-update Iter25 control
-
-<video src="https://github.com/user-attachments/assets/0d061873-7fea-4fdf-850d-69ca9d795c8d" controls width="100%" poster="../assets/demos/pacman-stage2-control-seed12-sample00-poster.png"></video>
-
-[Download the versioned control MP4](../assets/demos/pacman-stage2-control-seed12-sample00.mp4)
-
-##### After optimizer update 2
-
-<video src="https://github.com/user-attachments/assets/81ef8afc-2a14-407c-92e4-b1e0f44743e2" controls width="100%" poster="../assets/demos/pacman-stage2-update2-seed12-sample00-poster.png"></video>
-
-[Download the versioned Update 2 MP4](../assets/demos/pacman-stage2-update2-seed12-sample00.mp4)
+<table>
+  <tr>
+    <th width="50%">Pre-update Iter25 control</th>
+    <th width="50%">After optimizer update 2</th>
+  </tr>
+  <tr>
+    <td valign="top">
+      <video src="https://github.com/user-attachments/assets/0d061873-7fea-4fdf-850d-69ca9d795c8d" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-stage2-control-seed12-sample00-poster.png"></video>
+    </td>
+    <td valign="top">
+      <video src="https://github.com/user-attachments/assets/81ef8afc-2a14-407c-92e4-b1e0f44743e2" controls preload="metadata" playsinline width="100%" poster="../assets/demos/pacman-stage2-update2-seed12-sample00-poster.png"></video>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">54 environment steps · safety refusal<br>152 normal pellets remaining</td>
+    <td align="center">352 environment steps<br><strong>All normal pellets cleared</strong></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="../assets/demos/pacman-stage2-control-seed12-sample00.mp4">Download control MP4</a></td>
+    <td align="center"><a href="../assets/demos/pacman-stage2-update2-seed12-sample00.mp4">Download Update 2 MP4</a></td>
+  </tr>
+</table>
 
 These videos visualize one matched in-sample example. They do not by themselves estimate
 win-rate improvement, demonstrate held-out transfer, or establish reliable ghost
