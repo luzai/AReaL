@@ -157,7 +157,7 @@ This cold-start barrier motivates a curriculum-learning-like progression: introd
 visual grounding, local action selection, and longer-horizon planning in stages rather
 than demand full-game competence from the initial policy.
 
-### 3.2 Slow iteration under a fixed GPU budget
+### 3.2 Slow experiments under a fixed GPU budget
 
 Consider an experimental run with 49 optimizer updates, each requiring 48 rollout
 episodes. From the first rollout of Iter1 to the last rollout of Iter49, the end-to-end
@@ -174,23 +174,56 @@ log-probability costs. Model offloading, memory-aware batching, distributed traj
 processing, and checkpoint retention are therefore part of the training design, not
 optional infrastructure polish.
 
-### 3.3 Rollout and training must use the same admissible-action set
+### 3.3 Admissible-action mismatch mis-specifies PPO ratios
 
-At decision `t`, the environment under the primitive-action policy, or the deterministic
-option harness under the harness-mediated option policy, constructs `A(s_t)`. Rollout
-inference must sample only from this set, while the PPO actor must evaluate the sampled
-token under a policy normalized over the same recorded set. vLLM already exposes a
-token-level constraint through
-[`allowed_token_ids`](https://docs.vllm.ai/en/stable/api/vllm/sampling_params/), but an
-FSDP actor is not a decoder: a standard forward pass computes probabilities over the
-full model vocabulary. Sending `A(s_t)` only to vLLM would therefore give rollout and
-training different normalization denominators and invalidate the PPO ratio even though
-all tensor shapes match.
+At decision `t`, let `A_t = A(s_t) ⊆ V` be the recorded state-dependent
+admissible-action set. Constrained decoding makes the vLLM rollout distribution a
+behavior policy `π_behav` renormalized over `A_t`.
+[AReaL's decoupled PPO objective](https://arxiv.org/abs/2505.24298) distinguishes that
+behavior policy from the pre-update proximal policy `π_prox` and the current actor
+policy `π_θ`. It uses a behavior correction and a
+[clipped PPO probability ratio](https://arxiv.org/abs/1707.06347):
 
-The token-ID encoding of the admissible-action set must consequently travel with every
-generated action through distributed trajectory processing into policy evaluation. The
-actor and, when enabled, the reference model must each renormalize their own logits over
-exactly that recorded set using the same temperature.
+```math
+w_t = \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}
+           {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)},
+\qquad
+r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t,A_t)}
+                   {\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}.
+```
+
+Every probability in these ratios must use the same `A_t` and temperature. If rollout
+sampling is normalized over `A_t` but the FSDP actor computes `π_prox` over the full
+vocabulary `V`, the behavior correction instead contains
+
+```math
+\widetilde{w}_t
+= \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,V)}
+       {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)}
+= \frac{Z_{A_t}}{Z_V} \neq 1
+\quad\text{when the model parameters match}.
+```
+
+This is a normalization error, not policy staleness. It creates spurious importance
+weights, can reject or clip valid samples, and sends gradient into inadmissible logits.
+The rollout can remain legal and the loss finite while the surrogate gradient no longer
+represents the constrained policy that generated the data.
+
+[Huang and Ontañón](https://arxiv.org/abs/2006.14171) call the analogous combination of
+masked sampling and unmasked policy-gradient evaluation **naive invalid action
+masking**. Their PPO experiments produced much larger KL divergence and more variable
+convergence than consistent masking. The failure was also operationally visible in a
+separate reference-free Step512 diagnostic continuation. After 14 updates had completed,
+the gate for the fifteenth attempted update examined 4,345 option sequences; 311
+(`7.16%`) had `π_prox/π_behav` outside `[0.8, 1.25]`. This exceeded the configured `7%`
+limit, so the run failed closed before advantage computation and PPO. The diagnostic
+establishes behavior–proximal likelihood drift; it does not identify an
+admissible-action mismatch as the sole cause.
+
+The exact token IDs for `A_t`, the sampled token, rollout temperature, and behavior
+log-probability must therefore travel together through distributed batching. Section 4.3
+describes how the FSDP actor and, for KL regularization, the reference policy reuse that
+recorded constraint.
 
 ### 3.4 Credit assignment has two axes: timescale and episode weight
 
@@ -320,21 +353,23 @@ is the model distribution renormalized over that set:
 
 At rollout time, the workflow maps the identifiers in `A(s)` to exact tokenizer IDs. A
 small AReaL request adapter forwards them to vLLM's built-in `allowed_token_ids`, which
-masks other tokens before sampling. The rollout engine records the behavior
-log-probability after applying the token constraint and temperature.
+masks other tokens before sampling. The rollout engine records the constrained behavior
+log-probability `log π_behav` after applying the token constraint and temperature.
 
 The rollout stores the sampled token, temperature, behavior log-probability, and exact
-admissible-action set together. During policy evaluation, the FSDP actor and reference
-model do **not** decode. Each takes its own logits and renormalizes them over the
-recorded `A(s)` before computing log-probability and entropy. Their distributions need
-not be equal because their parameters may differ; their recorded admissible-action set
-and normalization rule must match. If `|A(s)| = 1`, the constrained probability is one
-and the log-probability is zero.
+admissible-action set together. Before an update, the FSDP actor recomputes the proximal
+log-probability `log π_prox`; during the PPO forward pass, it evaluates the current
+policy `log π_θ`. Neither operation decodes. Both renormalize the actor's logits over
+the recorded `A(s)`. When KL regularization is enabled, the reference policy `π_ref`
+uses the same set and temperature, although it is not a denominator of the PPO ratio.
+These distributions need not be equal because their parameters or versions may differ;
+their admissible-action set and normalization rule must match. If `|A(s)| = 1`, the
+constrained probability is one and the log-probability is zero.
 
 The key invariant is stronger than “apply an action mask”:
 
-> Rollout generation, actor log-probability computation, and reference log-probability
-> computation—when enabled—must use the same recorded admissible-action set and
+> Rollout behavior, proximal-actor, current-actor, and reference-policy
+> log-probabilities—when enabled—must use the same recorded admissible-action set and
 > temperature.
 
 ### 4.4 Reward design: learn from events, not raw score
