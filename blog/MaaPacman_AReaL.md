@@ -157,7 +157,7 @@ This cold-start barrier motivates a curriculum-learning-like progression: introd
 visual grounding, local action selection, and longer-horizon planning in stages rather
 than demand full-game competence from the initial policy.
 
-### 3.2 Training feedback arrives slowly
+### 3.2 Experimental feedback arrives slowly
 
 Consider the 256-step run: it completed 49 optimizer updates, each requiring 48 rollout
 episodes. From the first Iter1 rollout to the last Iter49 rollout, collecting these
