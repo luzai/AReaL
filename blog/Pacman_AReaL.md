@@ -318,14 +318,12 @@ harness recomputes and revalidates the selected strategy and target, stopping on
 completion, invalidation, episode termination or truncation, or the commitment cap. The
 result is a bounded, revalidated action chunk rather than blind replay of a fixed route.
 
-In a separate paired in-sample evaluation snapshot covering the same 60 episode IDs for
-each of four evaluated policy versions—240 rollouts in total—37,459 fresh model
-decisions controlled 55,975 primitive environment steps, or **1.49 steps per model
-turn**. One trajectory row is one `env.step(action)`; a model turn is a row with
-`model_called=true`. The ratio stays close to one because `COLLECT` accounted for 85.9%
-of model turns and 86.6% of those chunks ended after one step. This is a descriptive
-measurement of realized option granularity in that snapshot, not a universal constant or
-a Stage II performance result.
+Empirically, each model-selected option controlled **1.49 primitive environment steps**
+on average, compared with one step per decision under primitive-action control. This
+shows that the deterministic harness can reduce model-call frequency by expanding one
+high-level choice into a bounded, revalidated action chunk. The realized saving was
+modest because most `COLLECT` options targeted a nearby pellet and ended after one step.
+This figure describes option granularity in this evaluation, not Stage II performance.
 
 This division of labor is intentional. The option harness owns deterministic legality
 checks, route construction, and safety validation; the learned policy decides which
