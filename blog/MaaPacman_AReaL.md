@@ -135,13 +135,12 @@ remaining pellets was 48. The model could recognize the scene as Pacman while st
 failing to ground the state needed for control.
 
 This creates a cold-start problem for reinforcement learning. In an early strict
-image-only, no-training pilot, `0/32` rollouts completed the simple maze; all reached
-the step limit and every trajectory returned `-20`. The issue was therefore not only
-sparse feedback but reward degeneracy. With no within-group return variation,
-group-relative normalization would assign zero advantage to every sample and provide no
-policy-gradient signal. Increasing the rollout horizon cannot repair missing visual
-grounding or planning; it may only make the same uninformative trajectories longer and
-more expensive.
+image-only, no-training pilot, none of 32 rollouts completed the maze. Every episode ran
+to the step limit and produced the same negative episode return. With no within-group
+return variation, group-relative normalization would assign zero advantage to every
+sample and provide no policy-gradient signal. Increasing the rollout horizon cannot
+repair missing visual grounding or planning; it may only make the same uninformative
+trajectories longer and more expensive.
 
 The seed-0 replay below gives a qualitative view of the resulting control failure. The
 original, untrained Qwen3.5-9B policy makes little useful progress and eventually
@@ -157,7 +156,7 @@ This cold-start barrier motivates a curriculum-learning-like progression: introd
 visual grounding, local action selection, and longer-horizon planning in stages rather
 than demand full-game competence from the initial policy.
 
-### 3.2 Slow experiments under a fixed GPU budget
+### 3.2 Long feedback cycles and GPU memory requirements
 
 Consider an experimental run with 49 optimizer updates, each requiring 48 rollout
 episodes. From the first rollout of Iter1 to the last rollout of Iter49, the end-to-end
@@ -167,9 +166,9 @@ hours.
 If the architecture or experimental design contains a subtle bug, the learning curve may
 not reveal it for many hours, by which point substantial compute has already been spent.
 
-That slow feedback loop must also fit within a fixed systems budget. On our single 8-GPU
-node, the vLLM rollout engine, FSDP actor, and optional reference model share the
-available compute and memory. Long rollout episodes also increase trajectory-storage and
+The experiments also have substantial GPU memory requirements. The vLLM rollout engine,
+FSDP actor, and optional reference model share the available compute and memory on the
+same 8-GPU node. Long rollout episodes also increase trajectory-storage and
 log-probability costs. Model offloading, memory-aware batching, distributed trajectory
 processing, and checkpoint retention are therefore part of the training design, not
 optional infrastructure polish.
