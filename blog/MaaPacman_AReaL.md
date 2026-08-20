@@ -159,13 +159,14 @@ than demand full-game competence from the initial policy.
 
 ### 3.2 Training feedback arrives slowly
 
-The 256-step run completed 49 optimizer updates. Each update required 48 rollout
-episodes, for 2,352 episodes in total. From the first Iter1 rollout to the last Iter49
-rollout, these cycles spanned 46.21 hours—about 57 minutes each. The unoptimized 50th
-rollout batch is excluded.
+Consider the 256-step run: it completed 49 optimizer updates, each requiring 48 rollout
+episodes. From the first Iter1 rollout to the last Iter49 rollout, collecting these
+episodes with interleaved optimization spanned 46.21 hours in total. A 50th rollout
+batch is excluded because its optimizer update did not run.
 
-A bug visible only in the learning curve could therefore waste nearly two days while
-still producing plausible but invalid results.
+If the architecture or experimental design contains a subtle bug, we may have to wait
+many hours for the learning curve to expose it—after substantial compute has already
+been spent.
 
 ### 3.3 The full training loop must fit within a limited GPU budget
 
