@@ -212,11 +212,11 @@ represents the constrained policy that generated the data.
 masked sampling and unmasked policy-gradient evaluation **naive invalid action
 masking**. Their PPO experiments produced much larger KL divergence and more variable
 convergence than consistent masking. A related operational failure appeared in a
-separate reference-free 512-step diagnostic continuation. Behavior–proximal likelihood
-drift exceeded the configured alignment gate, so an attempted update failed closed
-before advantage computation and PPO. This observation shows that rollout–training
-probability disagreement can halt learning; it does not identify mismatched action
-constraints as the sole cause.
+separate 512-step diagnostic continuation. Behavior–proximal likelihood drift exceeded
+the configured alignment gate, so an attempted update failed closed before advantage
+computation and PPO. This observation shows that rollout–training probability
+disagreement can halt learning; it does not identify mismatched action constraints as
+the sole cause.
 
 The exact token IDs for `A_t`, the sampled token, rollout temperature, and behavior
 log-probability must therefore travel together through distributed batching. Section 4.3
