@@ -157,20 +157,15 @@ This cold-start barrier motivates a curriculum-learning-like progression: introd
 visual grounding, local action selection, and longer-horizon planning in stages rather
 than demand full-game competence from the initial policy.
 
-### 3.2 Long-horizon feedback is expensive
+### 3.2 Training feedback arrives slowly
 
-The run with a 256-step rollout cap completed 49 optimizer updates, labeled Iter1
-through Iter49. Before each update, it collected a rollout batch of 48 episodes, each
-capped at 256 environment steps, yielding 2,352 episodes across the 49 batches. The
-interval from the first recorded rollout in the Iter1 batch to the last recorded rollout
-in the Iter49 batch was 46.21 hours, or about 57 minutes per batch. Because rollout
-collection and optimizer updates were interleaved, this measurement represents the
-end-to-end wall-clock span—not the sum of individual rollout latencies. A 50th rollout
-batch was collected, but its optimizer update did not run, so it is excluded.
+The 256-step run completed 49 optimizer updates. Each update required 48 rollout
+episodes, for 2,352 episodes in total. From the first Iter1 rollout to the last Iter49
+rollout, these cycles spanned 46.21 hours—about 57 minutes each. The unoptimized 50th
+rollout batch is excluded.
 
-This makes incorrect experiments unusually costly: a subtle reward, terminal-state, or
-log-probability bug can consume nearly two days while still producing a plausible but
-invalid learning curve.
+A bug visible only in the learning curve could therefore waste nearly two days while
+still producing plausible but invalid results.
 
 ### 3.3 The full training loop must fit within a limited GPU budget
 
