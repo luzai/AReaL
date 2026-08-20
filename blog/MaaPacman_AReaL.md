@@ -86,10 +86,10 @@ the harness-mediated option policy, it is a fixed, bounded vocabulary of high-le
 option identifiers. In both cases, the policy must sample from the current `A(s_t)`
 rather than the full action vocabulary.
 
-| Setting                            | Model output                                             | Admissible-action set at one decision                       | Execution unit                                     |
-| ---------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------- |
-| **Primitive-action policy**        | One primitive-action identifier                          | Identifiers for directions open in the current state        | One primitive environment step                     |
-| **Harness-mediated option policy** | One identifier for a harness-generated high-level option | Identifiers for the options advertised in the current state | A bounded, revalidated sequence of primitive steps |
+| Setting                            | Model output                                             | Admissible-action set at one decision                       | Execution unit                                     | Stage in this study      |
+| ---------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------- | ------------------------ |
+| **Primitive-action policy**        | One primitive-action identifier                          | Identifiers for directions open in the current state        | One primitive environment step                     | Stage I · ghost-free     |
+| **Harness-mediated option policy** | One identifier for a harness-generated high-level option | Identifiers for the options advertised in the current state | A bounded, revalidated sequence of primitive steps | Stage II · ghost-enabled |
 
 In the primitive-action policy, one model decision directly controls one game step.
 Constrained decoding removes directions that are blocked in the current state, but the
