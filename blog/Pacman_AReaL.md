@@ -11,11 +11,11 @@ answering a single static prompt? We study this question through Pacman.
 controlled game environment and interaction adapters, while AReaL provides the rollout
 and distributed reinforcement-learning infrastructure.
 
-The model repeatedly observes the game, selects an action available in the current
-state, and learns from consequences that unfold across a complete game trajectory. Our
-goal is not simply to maximize a Pacman score, but to understand the task definition,
-feedback design, and systems support needed to train long-horizon visual agents
-reliably.
+The model repeatedly observes the game, selects an action from the current state's
+admissible-action set, and learns from consequences that unfold across a complete game
+trajectory. Our goal is not simply to maximize a Pacman score, but to understand the
+task definition, feedback design, and systems support needed to train long-horizon
+visual agents reliably.
 
 ## 1. Motivation: Why Games, and Why Start with Pacman?
 
@@ -60,7 +60,7 @@ long-horizon game through a sequence of grounded decisions?
 
 Unlike a static vision-language task, Pacman requires a closed interaction loop. Each
 model output changes the environment and therefore determines the next observation, the
-next set of available actions, and the agent's eventual outcome. One game may contain
+next admissible-action set, and the agent's eventual outcome. One game may contain
 hundreds of such dependent decisions.
 
 ### 2.1 Two policy settings
@@ -175,50 +175,17 @@ log-probability costs. Model offloading, memory-aware batching, distributed traj
 processing, and checkpoint retention are therefore part of the training design, not
 optional infrastructure polish.
 
-### 3.3 Mismatched action constraints mis-specify PPO ratios
+### 3.3 Admissible actions are not enough for correct training
 
-At decision `t`, let `A_t = A(s_t) ⊆ V` be the recorded state-dependent
-admissible-action set. Constrained decoding makes the vLLM rollout distribution a
-behavior policy `π_behav` renormalized over `A_t`.
-[AReaL's decoupled PPO objective](https://arxiv.org/abs/2505.24298) distinguishes that
-behavior policy from the pre-update proximal policy `π_prox` and the current actor
-policy `π_θ`. It uses a behavior correction and a
-[clipped PPO probability ratio](https://arxiv.org/abs/1707.06347):
+Constrained decoding keeps model output inside the current state-dependent
+admissible-action set. But a rollout containing only admissible actions can still lead
+to an incorrect PPO update if rollout and training use different admissible-action sets
+or temperatures to score the chosen action.
 
-```math
-w_t = \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}
-           {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)},
-\qquad
-r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t,A_t)}
-                   {\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}.
-```
-
-Every probability in these ratios must use the same `A_t` and temperature. If rollout
-sampling is normalized over `A_t` but the FSDP actor computes `π_prox` over the full
-vocabulary `V`, the behavior correction instead contains
-
-```math
-\widetilde{w}_t
-= \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,V)}
-       {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)}
-= \frac{Z_{A_t}}{Z_V} \neq 1
-\quad\text{when the model parameters match}.
-```
-
-This is a normalization error, not policy staleness. It creates spurious importance
-weights, can reject or clip valid samples, and sends gradient into inadmissible logits.
-The rollout can remain legal and the loss finite while the surrogate gradient no longer
-represents the constrained policy that generated the data.
-
-[Huang and Ontañón](https://arxiv.org/abs/2006.14171) call the analogous combination of
-masked sampling and unmasked policy-gradient evaluation **naive invalid action
-masking**. Their PPO experiments produced much larger KL divergence and more variable
-convergence than consistent masking.
-
-The exact token IDs for `A_t`, the sampled token, rollout temperature, and behavior
-log-probability must therefore travel together through distributed batching. Section 4.3
-describes how the FSDP actor and, for KL regularization, the reference policy reuse that
-recorded constraint.
+PPO can then mistake a bookkeeping mismatch for a policy change. Valid samples may be
+clipped or rejected, and training may update inadmissible actions—even though every
+executed action was admissible and the loss remains finite. Section 4.3 gives the
+precise formulation and implementation contract.
 
 ### 3.4 Credit assignment has two axes: timescale and episode weight
 
@@ -226,33 +193,15 @@ Long-horizon learning raises two related but distinct questions: what learning s
 should each decision receive, and how much total optimization weight should each episode
 receive?
 
-Episode-level GRPO preserves an episode-level shaped objective: intermediate step
-rewards are summed over the rollout episode before returns from the same initial prompt
-are normalized. GRPO therefore does not ignore intermediate rewards. The loss of
-information happens afterward: the same normalized episode-return task signal is
-assigned to every model decision in that episode. A useful move, a bad detour, and the
-action preceding death all receive the same coarse credit.
+Episode-level feedback aligns learning with the whole-game outcome but gives every
+decision in an episode the same coarse task signal. Step- or option-level feedback is
+more precise in time, but may miss consequences that appear later. These feedback
+timescales are complementary rather than interchangeable.
 
-An immediate step reward or option-span return offers finer temporal feedback, but its
-limitation is the opposite: it is local. By itself, it neither propagates consequences
-that arrive after the scored span nor compares the selected action with alternatives. An
-immediate pellet gain may lead into a dead end, while safe repositioning may pay off
-only much later. Without a state-conditioned or counterfactual baseline, such a return
-is local feedback, not a true local advantage. Episode-level GRPO and intermediate
-rewards are therefore not alternatives; the challenge is to combine long-horizon
-alignment with useful local credit.
-
-Episode weighting is a separate issue. A flat mean over trained tokens gives a longer
-trajectory more total gradient weight merely because it contains more model decisions.
-The distributed pipeline must preserve episode boundaries so it can average within each
-episode before averaging across episodes, while still balancing the actual token load:
-
-```text
-initial prompt / maze
-└── environment rollout episode
-    └── model decision (primitive action or harness-generated high-level option)
-        └── output token
-```
+Separately, a flat mean over trained tokens can give a longer trajectory more influence
+simply because it contains more model decisions. The objective must therefore preserve
+the intended feedback timescale without letting episode length determine episode weight.
+Section 4.5 specifies the implemented contracts.
 
 ## 4. Method
 
@@ -323,7 +272,6 @@ on average, compared with one step per decision under primitive-action control. 
 shows that the deterministic harness can reduce model-call frequency by expanding one
 high-level choice into a bounded, revalidated action chunk. The realized saving was
 modest because most `COLLECT` options targeted a nearby pellet and ended after one step.
-This figure describes option granularity in this evaluation, not Stage II performance.
 
 This division of labor is intentional. The option harness owns deterministic legality
 checks, route construction, and safety validation; the learned policy decides which
@@ -333,30 +281,62 @@ hand-coded Pacman solver.
 
 ### 4.3 Constraint alignment across rollout and training
 
-For either policy setting, let `A(s)` be the state-dependent admissible-action set. At
-the training temperature, with no additional nucleus truncation, the constrained policy
-is the model distribution renormalized over that set:
+At decision `t`, let `A_t = A(s_t) ⊆ V` be the recorded state-dependent
+admissible-action set, and let `𝒱_tok` denote the model's full tokenizer vocabulary. At
+temperature `T`, with no additional nucleus truncation, the constrained policy is the
+model distribution renormalized over `A_t`:
 
 ```math
-\pi_\theta(a \mid s, A(s))
-= \frac{\exp(z_\theta(a,s)/T)}
-{\sum_{a'\in A(s)} \exp(z_\theta(a',s)/T)},
-\qquad a\in A(s).
+\pi_\theta(a \mid s_t, A_t)
+= \frac{\exp(z_\theta(a,s_t)/T)}
+{\sum_{a'\in A_t} \exp(z_\theta(a',s_t)/T)},
+\qquad a\in A_t.
 ```
 
-At rollout time, the workflow maps the identifiers in `A(s)` to exact tokenizer IDs. A
-small AReaL request adapter forwards them to vLLM's built-in `allowed_token_ids`, which
-masks other tokens before sampling. The rollout engine records the constrained behavior
-log-probability `log π_behav` after applying the token constraint and temperature.
+[AReaL's decoupled PPO objective](https://arxiv.org/abs/2505.24298) distinguishes the
+vLLM rollout behavior policy `π_behav`, the pre-update proximal policy `π_prox`, and the
+current actor policy `π_θ`. Its behavior correction and
+[clipped PPO probability ratio](https://arxiv.org/abs/1707.06347) are
 
-The rollout stores the sampled token, temperature, behavior log-probability, and exact
-admissible-action set together. Before an update, the FSDP actor recomputes the proximal
-log-probability `log π_prox`; during the PPO forward pass, it evaluates the current
-policy `log π_θ`. Neither operation decodes. Both renormalize the actor's logits over
-the recorded `A(s)`. When KL regularization is enabled, the reference policy `π_ref`
+```math
+w_t = \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}
+           {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)},
+\qquad
+r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t,A_t)}
+                   {\pi_{\mathrm{prox}}(a_t \mid s_t,A_t)}.
+```
+
+Every probability in these ratios must use the same recorded `A_t` and temperature. If
+rollout sampling is normalized over `A_t` but the FSDP actor computes `π_prox` over the
+full tokenizer vocabulary `𝒱_tok`, then even matching model parameters give
+
+```math
+\widetilde{w}_t
+= \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,\mathcal V_{\mathrm{tok}})}
+       {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t)}
+= \frac{Z_{A_t}}{Z_{\mathcal V_{\mathrm{tok}}}} \neq 1.
+```
+
+This is a normalization error, not policy staleness. It creates spurious importance
+weights, can reject or clip valid samples, and sends gradient into inadmissible logits.
+[Huang and Ontañón](https://arxiv.org/abs/2006.14171) study the analogous case of
+sampling from a masked distribution while computing policy-gradient updates from the
+unmasked distribution, which they call **naive invalid action masking**. In their PPO
+experiments, this inconsistency produced substantially higher KL divergence and more
+variable convergence than consistent masking.
+
+At rollout time, the workflow maps the identifiers in `A_t` to exact tokenizer IDs. A
+small AReaL request adapter forwards them to vLLM's built-in `allowed_token_ids`, which
+masks other tokens before sampling. The rollout stores the sampled token, temperature,
+constrained behavior log-probability `log π_behav`, and exact `A_t` together so they
+remain aligned through distributed batching.
+
+Before an update, the FSDP actor recomputes `log π_prox`; during the PPO forward pass,
+it evaluates `log π_θ`. Neither operation decodes. Both renormalize the actor's logits
+over the recorded `A_t`. When KL regularization is enabled, the reference policy `π_ref`
 uses the same set and temperature, although it is not a denominator of the PPO ratio.
 These distributions need not be equal because their parameters or versions may differ;
-their admissible-action set and normalization rule must match. If `|A(s)| = 1`, the
+their admissible-action set and normalization rule must match. If `|A_t| = 1`, the
 constrained probability is one and the log-probability is zero.
 
 The key invariant is stronger than “apply an action mask”:
@@ -413,43 +393,44 @@ completion and held-out success remain the primary evaluation metrics.
 
 The reward function defines what feedback the environment produces; the objective
 contract defines how that feedback is assigned, normalized, and reduced into an update.
-These are separate design choices. We organize the implemented contracts into two
-high-level families.
+These are separate design choices with three independent dimensions.
 
-The **temporally local-feedback family** assigns a decision the reward from its
-immediate environment step, or, for a harness-generated high-level option, the sum over
-that option's committed execution span:
+**Feedback timescale.** A decision can receive the reward from its immediate environment
+step, or, for a harness-generated high-level option, the sum over that option's
+committed execution span:
 
 ```math
 R^{\text{option}}_{e,j}
 = \sum_{t\in\text{committed span}(e,j)} r_{e,t}.
 ```
 
-In its raw form, it applies neither reward normalization nor advantage normalization.
-This gives dense, temporally local feedback, but it does not propagate consequences that
-occur after the scored step or option ends. Normalizing these local scores changes their
-scale or comparison batch, not the timescale at which credit is assigned. An option-span
-return is therefore a local score, not a counterfactual or state-conditioned advantage.
-
-The **episode-level group-relative family** first sums all shaped step rewards over one
-rollout episode:
+Both choices provide temporally local feedback and do not propagate consequences beyond
+the scored step or option. An option-span return is therefore a local score, not a
+counterfactual or state-conditioned advantage. At the episode timescale, all shaped step
+rewards are instead summed over one rollout episode:
 
 ```math
 R_e=\sum_t r_{e,t}.
 ```
 
-Exactly 12 episodes sampled from the same initial prompt are normalized with the group
-sample standard deviation:
+The resulting episode signal preserves the whole-episode objective, but assigns the same
+coarse task signal to every model decision in that episode.
+
+**Normalization.** A local or episode-level signal may be used raw or normalized. In the
+episode-level group-relative contract, returns sampled from the same initial prompt are
+normalized with the group sample standard deviation:
 
 ```math
 G_e=\frac{R_e-\mu_{\text{prompt}}}
 {\sigma_{\text{prompt}}+10^{-5}}.
 ```
 
-The same group-relative episode signal is assigned to the model decisions in that
-episode. Intermediate rewards are not discarded: their temporal locations are lost when
-they are aggregated into one episode return. Loss is then averaged within each rollout
-episode before episodes are averaged:
+Normalizing a local signal changes its scale or comparison group, not its feedback
+timescale. Likewise, episode aggregation retains the sum of intermediate rewards but
+discards where within the episode they occurred.
+
+**Episode weighting.** Loss is averaged within each rollout episode before episodes are
+averaged:
 
 ```math
 L=\frac{1}{|E|}\sum_{e\in E}
@@ -516,12 +497,12 @@ and greedy decoding for evaluation.
 
 #### Objective and evidence
 
-| Phase                   | Feedback timescale | Training objective                      | Main evidence                      | Claim boundary                                  |
-| ----------------------- | ------------------ | --------------------------------------- | ---------------------------------- | ----------------------------------------------- |
-| **Stage I-A**           | Per decision       | Locally shaped rewards, normalized      | Iter16 selected over Iter49        | Checkpoint diagnostic, not a success-rate study |
-| **Stage I-B**           | Per decision       | Raw locally shaped rewards              | Iter25/31; 44/50 held-out mazes    | Geometry transfer in ghost-free safe mode       |
-| **Stage II probe**      | Not applicable     | None—rollout only                       | Iter25 `8/12` vs. base `2/12`      | Single-seed transfer probe, not training gain   |
-| **Stage II validation** | Whole episode      | Prompt-group-relative episode objective | Three updates completed end to end | Training-path check, not an improvement claim   |
+| Phase                   | Reward-to-objective contract                                   | Main evidence                      | Evidence scope              |
+| ----------------------- | -------------------------------------------------------------- | ---------------------------------- | --------------------------- |
+| **Stage I-A**           | Temporally local per-decision feedback (no episode-level GRPO) | Iter16 selected over Iter49        | Checkpoint selection        |
+| **Stage I-B**           | Temporally local per-decision feedback (no episode-level GRPO) | Iter25/31; 44/50 held-out mazes    | Ghost-free maze transfer    |
+| **Stage II probe**      | No training                                                    | Iter25 `8/12` vs. base `2/12`      | Preliminary transfer signal |
+| **Stage II validation** | Episode-level group-relative objective (GRPO)                  | Three updates completed end to end | Training-path validation    |
 
 Both Stage I phases used temporally local per-decision feedback rather than the
 whole-episode group-relative objective used in the bounded Stage II validation. Here,
@@ -535,7 +516,7 @@ episode-level GRPO.
 ### 5.1 Stage I: Ghost-free primitive-action navigation
 
 Both Stage I phases ask the model to perceive the maze from the current screenshot and
-choose one legal primitive direction at each decision. Stage I-B continues from the
+choose one admissible primitive direction at each decision. Stage I-B continues from the
 checkpoint selected in Stage I-A and extends the rollout horizon. We report them as
 related phases, not as one causal learning curve.
 
@@ -550,9 +531,8 @@ Each update collected 48 rollout episodes from four prompt rows with 12 episodes
 prompt, sampled at temperature 0.7 on one 8-GPU node. Every rollout episode collected
 before a completed update reached the 256-step cap, so terminal evaluation was necessary
 to distinguish a useful checkpoint from one with merely high shaped reward. We completed
-49 optimizer updates. A subsequent 48-episode rollout batch was collected, but its
-optimizer update did not run and is excluded. Terminal evaluation selected Iter16 rather
-than the latest checkpoint.
+49 optimizer updates. Terminal evaluation selected Iter16 rather than the latest
+checkpoint.
 
 | Checkpoint      | Mean shaped reward in its rollout batch | Greedy wins on seeds 0, 1, 2 | Mean normal-pellet clear rate |
 | --------------- | --------------------------------------: | ---------------------------: | ----------------------------: |
@@ -675,10 +655,9 @@ They use the same frozen checkpoint, seed 0, greedy decoding, open-action maskin
   </tr>
 </table>
 
-*All three replays clear every normal pellet. The Level 5 layout was isolated in a safe
-runtime slot, and `real50_l10_v01` reuses the formal 50-maze evaluation trajectory. As
-in the quantitative study, ghosts and fruit are disabled, so these videos demonstrate
-geometry and pellet-collection behavior rather than ghost-aware play.*
+*All three replays clear every normal pellet. As in the quantitative study, ghosts and
+fruit are disabled, so these videos demonstrate geometry and pellet-collection behavior
+rather than ghost-aware play.*
 
 ### 5.2 Stage II: Ghost-enabled, harness-mediated option policy
 
@@ -781,27 +760,19 @@ without preserving terminal reliability. Limited late-episode credit and state c
 are plausible contributors, but this experiment does not isolate either mechanism or
 establish convergence to a local optimum.
 
-### 6.2 Reward normalization is an objective contract, not a tuning switch
+### 6.2 Reward processing defines the objective, not just its scale
 
-Reward aggregation determines both which trajectories are compared and the timescale at
-which credit is assigned. We distinguish four deliberate formulations:
+How rewards are aggregated, normalized, and reduced determines the learning objective. A
+normalized local reward remains local feedback; an episode return preserves the
+whole-game objective but provides coarser temporal credit. Episode averaging separately
+prevents longer trajectories from receiving more intended weight merely because they
+contain more trained tokens.
 
-| Formulation                                  | Effect on credit and episode weight                                                                                                                                                                                                                                     | Evidence status                                                                           |
-| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| **Temporally local per-decision feedback**   | Assigns immediate shaped rewards to decisions; may be raw or normalized, but does not propagate consequences that occur later in the episode                                                                                                                            | Used by both Stage I phases; scaling differed, timescale matched                          |
-| **Whole-episode group normalization**        | Normalizes 12 full collected rollout-episode returns from the same prompt and broadcasts one episode signal to every decision; preserves the episode objective but gives coarse temporal credit, and identical group returns yield no group-relative task-return signal | Used by the bounded Stage II validation run in Section 5.2; no long-run improvement claim |
-| **Raw option-span feedback**                 | Sums reward over one executed harness-generated high-level option; more local than an episode return, but is not a counterfactual or state-conditioned advantage estimate                                                                                               | Implemented for the harness-mediated option policy; not compared in the reported results  |
-| **Episode objective with a local auxiliary** | Keeps the episode objective primary while adding clipped option-local feedback; may combine both timescales but introduces a gradient-balancing problem                                                                                                                 | Future proposal; not implemented or trained                                               |
-
-For provenance, Stage I-A normalized immediate rewards collected from heterogeneous game
-states, while Stage I-B used raw per-decision rewards. That distinction affects scaling,
-not the credit-assignment timescale, and neither setup is an episode-level GRPO
-objective.
-
-These formulations have not been compared in a controlled ablation. Existing runs differ
-in checkpoint, horizon, and other settings, so they do not support a causal “normalized
-versus raw” conclusion. Such a comparison requires matched initialization, prompts,
-episode budget, optimizer settings, and evaluation.
+The reported runs do not isolate these choices. Stage I-A and Stage I-B differ in
+initialization, rollout horizon, and other settings, while Stage II also changes the
+environment and action interface. The results therefore do not establish that raw or
+normalized feedback—or local or episode-level feedback—is categorically better. That
+comparison requires a matched ablation.
 
 ### 6.3 Terminal outcomes expose proxy-metric failures
 
@@ -829,10 +800,11 @@ curve.
 The current evidence supports a useful but bounded conclusion. These are limits of the
 present implementation or evidence, rather than part of the task definition:
 
-1. **Structured-context dependence:** the harness-mediated option policy receives both
-   the screenshot and authoritative metadata for the currently advertised,
-   harness-generated high-level options. It therefore evaluates multimodal high-level
-   option selection rather than pixels-only game control.
+1. **Observation interface:** the harness-mediated option policy receives both the
+   screenshot and authoritative metadata for the currently advertised options. It
+   therefore evaluates multimodal high-level option selection rather than pixels-only
+   control. Future work should test temporal visual input such as two-frame or
+   map-plus-local observations.
 1. **Ghost-aware generalization:** separate prototype runs show that the
    harness-mediated option policy can complete ghost-enabled games, but the reported
    50-maze suite disables ghosts and fruit to isolate geometry. Repeat that suite with
@@ -842,24 +814,14 @@ present implementation or evidence, rather than part of the task definition:
    rules, route construction, and safety gates are currently handcrafted. A longer-term
    direction is to co-evolve the policy and option-generation mechanism while retaining
    deterministic legality and safety validation.
-1. **Repeated training:** rerun the same training setup with multiple random seeds to
-   separate a stable improvement from one favorable optimization path.
-1. **Matched checkpoint coverage:** evaluate Iter16, Iter25, and Iter31 on the same
-   50-maze suite; the current evidence does not show whether Iter16 would generalize
-   better than the later checkpoints.
-1. **A controlled reward-contract study:** compare raw per-decision feedback,
-   whole-episode normalization, raw option-span feedback, and any future auxiliary
-   objective under a matched budget.
-1. **A multi-timescale objective:** keep the episode loss primary while adding a small,
-   bounded local auxiliary alongside KL regularization. The first study should use a
-   fixed local-loss coefficient with matched ablations. A later version could adapt that
-   coefficient from the ratio of episode and local gradient norms and suppress the
-   auxiliary when their gradients conflict. This remains a proposal, not an implemented
-   or trained result.
-1. **Temporal visual input:** test two-frame or map-plus-local observations while
-   preserving multimodal alignment during distributed training.
-1. **Hard-maze diagnosis:** investigate the six hardest mazes failed by both Iter25 and
-   Iter31 before extending training merely because the pass rate has plateaued.
+1. **Evaluation coverage and hard-maze diagnosis:** repeat training with multiple random
+   seeds, evaluate Iter16, Iter25, and Iter31 on the same 50-maze suite, and investigate
+   the six hardest mazes failed by both Iter25 and Iter31 before extending training.
+1. **Controlled reward and credit study:** under matched initialization and budget,
+   compare raw per-decision feedback, whole-episode normalization, raw option-span
+   feedback, and an episode objective with a small bounded local auxiliary. The
+   auxiliary remains an untrained proposal; begin with a fixed coefficient before
+   considering adaptive gradient balancing.
 
 ## 8. Conclusion
 
