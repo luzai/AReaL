@@ -506,12 +506,15 @@ harness-mediated option policy and validated the whole-episode training path.
 
 #### Stage setup
 
-| Phase                   | Environment   | Action interface        | Initialization                | Rollout cap | Training budget                             | Decoding                     |
-| ----------------------- | ------------- | ----------------------- | ----------------------------- | ----------: | ------------------------------------------- | ---------------------------- |
-| **Stage I-A**           | Ghost-free    | One primitive direction | Base Qwen3.5-9B               |         256 | 49 updates × 48 episodes                    | `T=0.7` rollout; greedy eval |
-| **Stage I-B**           | Ghost-free    | One primitive direction | Continue from Iter16          |         512 | 48 episodes/update; total not reported here | Sampled rollout; greedy eval |
-| **Stage II probe**      | Ghost-enabled | Harness-mediated option | Base Qwen3.5-9B and Iter25    |         512 | 12 episodes/model; 0 updates                | `T=0.7`                      |
-| **Stage II validation** | Ghost-enabled | Harness-mediated option | Iter25 actor and KL reference |         512 | 3 updates × 48 episodes                     | Sampled rollout              |
+| Phase                   | Environment   | Action interface        | Initialization                | Rollout cap |
+| ----------------------- | ------------- | ----------------------- | ----------------------------- | ----------: |
+| **Stage I-A**           | Ghost-free    | One primitive direction | Base Qwen3.5-9B               |         256 |
+| **Stage I-B**           | Ghost-free    | One primitive direction | Continue from Iter16          |         512 |
+| **Stage II probe**      | Ghost-enabled | Harness-mediated option | Base Qwen3.5-9B and Iter25    |         512 |
+| **Stage II validation** | Ghost-enabled | Harness-mediated option | Iter25 actor and KL reference |         512 |
+
+We keep the same decoding settings throughout: `temperature=0.7` for training rollouts
+and greedy decoding for evaluation.
 
 #### Objective and evidence
 
