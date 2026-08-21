@@ -34,11 +34,12 @@ play; green is the best AI agent. Image credit: [ARC Prize](https://arcprize.org
 That gap is where the field has turned. Labs are no longer only scaling static datasets;
 they are training agents inside game-like worlds.
 [dots3-note Preview](https://studio.dots.ai/dots/dots3-en.html), the first open-weight
-model of Xiaohongshu (Rednote) dots studio's dots3 family, was RL-trained across thousands of novel
-interactive environments so that it explores, updates memory, and adapts mid-task—and it
-leads the official ARC-AGI-3 harness with 6.9 out of 100 (Figure 2). Benchmarks, model
-releases, and training recipes are converging on the same shape of problem: an agent, an
-environment that reacts, and a reward that only arrives many steps later.
+model of Xiaohongshu (Rednote) dots studio's dots3 family, was RL-trained across
+thousands of novel interactive environments so that it explores, updates memory, and
+adapts mid-task—and it leads the official ARC-AGI-3 harness with 6.9 out of 100 (Figure
+2). Benchmarks, model releases, and training recipes are converging on the same shape of
+problem: an agent, an environment that reacts, and a reward that only arrives many steps
+later.
 
 ![ARC-AGI scores reported for dots3-note Preview](../assets/figures/dots3_arcagi_scores.png)
 
@@ -149,13 +150,12 @@ trajectories longer and more expensive.
 The seed-0 replay below gives a qualitative view of the resulting control failure. The
 original, untrained Qwen3.5-9B policy makes little useful progress and eventually
 terminates as `STUCK`. The replay illustrates the behavioral consequence of weak visual
-grounding and planning; it does not by itself isolate which component caused each bad
-decision.
+grounding and planning.
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/2745b846-65d1-47a2-be22-8b79ee217ca1" controls preload="metadata" playsinline width="72%" poster="../assets/demos/pacman-base-seed0-poster.png"></video>
   <br>
-  <a href="../assets/demos/pacman-base-seed0.mp4">Download the versioned base-model MP4</a>
+  <a href="../assets/demos/pacman-base-seed0.mp4">Download MP4</a>
 </div>
 
 This cold-start barrier motivates a curriculum-learning-like progression: introduce
@@ -323,11 +323,9 @@ uses the same set and temperature, although it is not a denominator of the PPO r
 These distributions need not be equal because their parameters or versions may differ;
 their admissible-action set and normalization rule must match.
 
-The key invariant is stronger than “apply an action mask”:
-
-> Rollout behavior, proximal-actor, current-actor, and reference-policy
-> log-probabilities—when enabled—must use the same recorded admissible-action set and
-> temperature.
+Applying an action mask during rollout is not enough: every log-probability used by the
+rollout behavior, proximal actor, current actor, and reference policy (when enabled)
+must be computed with the same recorded admissible-action set and temperature.
 
 ### 4.4 Reward design: learn from events, not raw score
 
@@ -490,12 +488,9 @@ and greedy decoding for evaluation.
 
 Both Stage I phases used temporally local per-decision feedback rather than the
 whole-episode group-relative objective used in the bounded Stage II validation. Here,
-“local” describes the **credit-assignment timescale**, not the observation: the model
-still receives the current maze image at every decision.
-
-For reproducibility, Stage I-A normalized the local decision rewards, whereas Stage I-B
-used them raw. This changes the scaling, not the feedback timescale; neither phase used
-episode-level GRPO.
+“local” describes the **credit-assignment timescale**. It does not mean that the
+observation is local or partial—the model receives an up-to-date maze image at every
+decision.
 
 ### 5.1 Stage I: Ghost-free primitive-action navigation
 
@@ -564,8 +559,7 @@ replays make the Iter16-versus-Iter49 selection gap directly visible.
 </table>
 
 *On the original ghost-free benchmark maze, Iter16 clears the level while Iter49 gets
-stuck. The contrast shows why proxy progress cannot replace terminal checkpoint
-selection.*
+stuck, showing that near-complete pellet clearance does not guarantee terminal success.*
 
 #### Stage I-B: 512-step continuation and learning dynamics
 
