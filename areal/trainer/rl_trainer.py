@@ -49,8 +49,8 @@ from areal.infra import (
 )
 from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
-from areal.infra.rpc.rtensor import RTensor
 from areal.infra.data_service.rdataset import RDataset
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
@@ -175,8 +175,7 @@ def _compute_logp_in_rpc_chunks(
         group_sizes.append(group_size)
         group_seqlens.append(
             int(attention_mask.shape[-1])
-            if isinstance(attention_mask, torch.Tensor)
-            and attention_mask.ndim >= 2
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim >= 2
             else None
         )
         for sample_index in range(group_size):
@@ -248,15 +247,10 @@ def _compute_logp_in_rpc_chunks(
             # concatenating. Never crop an oversized result: that would hide a
             # dispatch/reordering bug instead of failing closed.
             normalized_group: list[torch.Tensor] = []
-            for value, expected_seqlen in zip(
-                group, expected_seqlens, strict=True
-            ):
+            for value, expected_seqlen in zip(group, expected_seqlens, strict=True):
                 if group_seqlen is not None and value.ndim >= 2:
                     result_seqlen = int(value.shape[-1])
-                    if (
-                        expected_seqlen is not None
-                        and result_seqlen != expected_seqlen
-                    ):
+                    if expected_seqlen is not None and result_seqlen != expected_seqlen:
                         raise RuntimeError(
                             f"{role} compute_logp returned sequence width "
                             f"{result_seqlen}, expected compacted input width "
@@ -267,9 +261,7 @@ def _compute_logp_in_rpc_chunks(
                             *value.shape[:-1],
                             group_seqlen - result_seqlen,
                         )
-                        value = torch.cat(
-                            (value, value.new_zeros(pad_shape)), dim=-1
-                        )
+                        value = torch.cat((value, value.new_zeros(pad_shape)), dim=-1)
                 normalized_group.append(value)
             results.append(
                 normalized_group[0]
@@ -277,9 +269,7 @@ def _compute_logp_in_rpc_chunks(
                 else torch.cat(normalized_group, dim=0)
             )
         else:
-            raise TypeError(
-                f"{role} compute_logp returned unsupported grouped results"
-            )
+            raise TypeError(f"{role} compute_logp returned unsupported grouped results")
     if offset != len(flat_results):
         raise RuntimeError(
             f"{role} compute_logp regrouped {offset} results but received "
@@ -306,7 +296,11 @@ def _audit_pacman_logprob_alignment(
     require_actor_reference_alignment: bool = True,
     expected_option_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """Verify rollout, proximal actor, and reference option probabilities.
+    """Verify rollout and proximal actor option probabilities.
+
+    Reference probabilities are also verified when present. Reference-free
+    training must explicitly disable actor/reference alignment; the rollout to
+    proximal-actor checks remain mandatory in that mode.
 
     ``exact`` requires the inference and training backends to reproduce token
     log-probabilities numerically. ``behavior`` still reports that exact check,
@@ -329,13 +323,30 @@ def _audit_pacman_logprob_alignment(
     if behavior_branch_mean_abs_log_ratio < 0.0:
         raise ValueError("Pacman behavior mean log-ratio tolerance must be >= 0")
     if not 0.0 <= behavior_max_filtered_fraction <= 1.0:
-        raise ValueError("Pacman behavior filtered-fraction tolerance must be in [0, 1]")
+        raise ValueError(
+            "Pacman behavior filtered-fraction tolerance must be in [0, 1]"
+        )
 
-    comparisons = {
-        "rollout_actor": [],
-        "rollout_reference": [],
-        "actor_reference": [],
-    }
+    reference_presence = ["ref_logp" in trajectory for trajectory in batch]
+    if any(reference_presence) and not all(reference_presence):
+        raise RuntimeError(
+            "Pacman log-prob audit found inconsistent reference log-probs"
+        )
+    reference_available = bool(batch) and all(reference_presence)
+    if require_actor_reference_alignment and not reference_available:
+        raise RuntimeError(
+            "Pacman log-prob audit requires reference log-probs when "
+            "actor-reference alignment is enabled"
+        )
+
+    comparisons = {"rollout_actor": []}
+    if reference_available:
+        comparisons.update(
+            {
+                "rollout_reference": [],
+                "actor_reference": [],
+            }
+        )
     records: list[dict[str, Any]] = []
     support_sizes: set[int] = set()
     for trajectory_index, trajectory in enumerate(batch):
@@ -344,45 +355,41 @@ def _audit_pacman_logprob_alignment(
             "loss_mask",
             "logprobs",
             "prox_logp",
-            "ref_logp",
             "versions",
             "pacman_allowed_token_ids",
         }
+        if reference_available:
+            required.add("ref_logp")
         missing = required - trajectory.keys()
         if missing:
             raise RuntimeError(
-                "Pacman log-prob audit missing fields: "
-                f"{sorted(missing)}"
+                f"Pacman log-prob audit missing fields: {sorted(missing)}"
             )
-        local = RTensor.localize(
-            {key: trajectory[key] for key in required}
-        )
+        local = RTensor.localize({key: trajectory[key] for key in required})
         input_ids = local["input_ids"].detach().cpu()
-        loss_mask = torch.roll(
-            local["loss_mask"].detach().cpu().bool(), -1, dims=-1
-        )
-        rollout = torch.roll(
-            local["logprobs"].detach().cpu().float(), -1, dims=-1
-        )
-        versions = torch.roll(
-            local["versions"].detach().cpu(), -1, dims=-1
-        )
+        loss_mask = torch.roll(local["loss_mask"].detach().cpu().bool(), -1, dims=-1)
+        rollout = torch.roll(local["logprobs"].detach().cpu().float(), -1, dims=-1)
+        versions = torch.roll(local["versions"].detach().cpu(), -1, dims=-1)
         actor = local["prox_logp"].detach().cpu().float()
-        reference = local["ref_logp"].detach().cpu().float()
+        reference = (
+            local["ref_logp"].detach().cpu().float() if reference_available else None
+        )
         sampled_ids = torch.roll(input_ids, -1, dims=-1)
         supports = torch.roll(
             local["pacman_allowed_token_ids"].detach().cpu(),
             -1,
             dims=-2,
         )
-        if not (
-            rollout.shape
-            == actor.shape
-            == reference.shape
-            == loss_mask.shape
-            == sampled_ids.shape
-            == versions.shape
-            == supports.shape[:-1]
+        expected_shape = rollout.shape
+        shapes = (
+            actor.shape,
+            loss_mask.shape,
+            sampled_ids.shape,
+            versions.shape,
+            supports.shape[:-1],
+        )
+        if any(shape != expected_shape for shape in shapes) or (
+            reference is not None and reference.shape != expected_shape
         ):
             raise RuntimeError("Pacman log-prob audit tensor shapes disagree")
         support_active = supports.ne(0).any(dim=-1)
@@ -393,9 +400,7 @@ def _audit_pacman_logprob_alignment(
         for batch_index, token_index in loss_mask.nonzero().tolist():
             encoded_support = supports[batch_index, token_index]
             support = [
-                int(value) - 1
-                for value in encoded_support.tolist()
-                if int(value) != 0
+                int(value) - 1 for value in encoded_support.tolist() if int(value) != 0
             ]
             sampled = int(sampled_ids[batch_index, token_index])
             if sampled not in support or len(support) != len(set(support)):
@@ -405,21 +410,19 @@ def _audit_pacman_logprob_alignment(
             values = {
                 "rollout": float(rollout[batch_index, token_index]),
                 "actor": float(actor[batch_index, token_index]),
-                "reference": float(reference[batch_index, token_index]),
             }
-            if not bool(
-                torch.isfinite(torch.tensor(list(values.values()))).all()
-            ):
+            if reference is not None:
+                values["reference"] = float(reference[batch_index, token_index])
+            if not bool(torch.isfinite(torch.tensor(list(values.values()))).all()):
                 raise RuntimeError("Pacman log-prob audit found NaN or Inf")
-            comparisons["rollout_actor"].append(
-                values["actor"] - values["rollout"]
-            )
-            comparisons["rollout_reference"].append(
-                values["reference"] - values["rollout"]
-            )
-            comparisons["actor_reference"].append(
-                values["actor"] - values["reference"]
-            )
+            comparisons["rollout_actor"].append(values["actor"] - values["rollout"])
+            if reference is not None:
+                comparisons["rollout_reference"].append(
+                    values["reference"] - values["rollout"]
+                )
+                comparisons["actor_reference"].append(
+                    values["actor"] - values["reference"]
+                )
             support_sizes.add(len(support))
             records.append(
                 {
@@ -452,9 +455,7 @@ def _audit_pacman_logprob_alignment(
             "min_importance_ratio": min(ratios),
             "max_importance_ratio": max(ratios),
             "max_abs_relative_probability_delta": max(relative),
-            "mean_abs_relative_probability_delta": (
-                sum(relative) / len(relative)
-            ),
+            "mean_abs_relative_probability_delta": (sum(relative) / len(relative)),
         }
         pair_max_tolerance = (
             actor_reference_max_abs_tolerance
@@ -471,12 +472,8 @@ def _audit_pacman_logprob_alignment(
         exact_aligned = exact_aligned and max_abs <= pair_max_tolerance
         exact_aligned = exact_aligned and mean_abs <= pair_mean_tolerance
 
-    branching_records = [
-        record for record in records if record["support_size"] > 1
-    ]
-    singleton_records = [
-        record for record in records if record["support_size"] == 1
-    ]
+    branching_records = [record for record in records if record["support_size"] > 1]
+    singleton_records = [record for record in records if record["support_size"] == 1]
     branching_log_ratios = [
         record["actor"] - record["rollout"] for record in branching_records
     ]
@@ -497,22 +494,28 @@ def _audit_pacman_logprob_alignment(
         <= behavior_ratio_upper
     ]
     singleton_abs_deltas = [
-        abs(record["actor"] - record["rollout"])
-        for record in singleton_records
+        abs(record["actor"] - record["rollout"]) for record in singleton_records
     ]
+    probability_roles = (
+        ("rollout", "actor", "reference")
+        if reference_available
+        else ("rollout", "actor")
+    )
     singleton_abs_logps = [
-        abs(record[role])
-        for record in singleton_records
-        for role in ("rollout", "actor", "reference")
+        abs(record[role]) for record in singleton_records for role in probability_roles
     ]
-    transitivity_residuals = [
-        abs(
-            (record["actor"] - record["rollout"])
-            - (record["reference"] - record["rollout"])
-            - (record["actor"] - record["reference"])
-        )
-        for record in records
-    ]
+    transitivity_residuals = (
+        [
+            abs(
+                (record["actor"] - record["rollout"])
+                - (record["reference"] - record["rollout"])
+                - (record["actor"] - record["reference"])
+            )
+            for record in records
+        ]
+        if reference_available
+        else []
+    )
     option_records = []
     for record in sorted(
         records,
@@ -524,11 +527,9 @@ def _audit_pacman_logprob_alignment(
     ):
         if (
             not option_records
-            or option_records[-1]["trajectory_index"]
-            != record["trajectory_index"]
+            or option_records[-1]["trajectory_index"] != record["trajectory_index"]
             or option_records[-1]["sample_index"] != record["sample_index"]
-            or option_records[-1]["end_token_index"] + 1
-            != record["token_index"]
+            or option_records[-1]["end_token_index"] + 1 != record["token_index"]
         ):
             option_records.append(
                 {
@@ -539,28 +540,24 @@ def _audit_pacman_logprob_alignment(
                     "support_sizes": [],
                     "joint_rollout_logp": 0.0,
                     "joint_actor_logp": 0.0,
-                    "joint_reference_logp": 0.0,
                 }
             )
+            if reference_available:
+                option_records[-1]["joint_reference_logp"] = 0.0
         option = option_records[-1]
         option["end_token_index"] = record["token_index"]
         option["support_sizes"].append(record["support_size"])
-        for role in ("rollout", "actor", "reference"):
+        for role in probability_roles:
             option[f"joint_{role}_logp"] += record[role]
     for option in option_records:
         option["token_count"] = len(option["support_sizes"])
-        log_ratio = (
-            option["joint_actor_logp"] - option["joint_rollout_logp"]
-        )
+        log_ratio = option["joint_actor_logp"] - option["joint_rollout_logp"]
         option["actor_rollout_log_ratio"] = log_ratio
         option["behavior_importance_ratio"] = math.exp(log_ratio)
-        for role in ("rollout", "actor", "reference"):
-            option[f"joint_{role}_probability"] = math.exp(
-                option[f"joint_{role}_logp"]
-            )
+        for role in probability_roles:
+            option[f"joint_{role}_probability"] = math.exp(option[f"joint_{role}_logp"])
     sample_keys = {
-        (record["trajectory_index"], record["sample_index"])
-        for record in records
+        (record["trajectory_index"], record["sample_index"]) for record in records
     }
     option_keys = {
         (option["trajectory_index"], option["sample_index"])
@@ -605,10 +602,11 @@ def _audit_pacman_logprob_alignment(
         <= behavior_ratio_upper
     ]
     actor_reference_aligned = (
-        metrics["actor_reference"]["max_abs_delta"]
-        <= actor_reference_max_abs_tolerance
+        metrics["actor_reference"]["max_abs_delta"] <= actor_reference_max_abs_tolerance
         and metrics["actor_reference"]["mean_abs_delta"]
         <= actor_reference_mean_abs_tolerance
+        if reference_available
+        else None
     )
     behavior_metrics = {
         "branching_tokens": len(branching_records),
@@ -654,15 +652,15 @@ def _audit_pacman_logprob_alignment(
         "singleton_max_abs_logp": (
             max(singleton_abs_logps) if singleton_abs_logps else 0.0
         ),
-        "transitivity_max_abs_residual": max(transitivity_residuals),
+        "transitivity_max_abs_residual": (
+            max(transitivity_residuals) if transitivity_residuals else None
+        ),
         "option_count": len(option_records),
         "option_min_importance_ratio": min(option_behavior_ratios),
         "option_max_importance_ratio": max(option_behavior_ratios),
         "ratio_lower_bound": behavior_ratio_lower,
         "ratio_upper_bound": behavior_ratio_upper,
-        "branching_mean_abs_log_ratio_tolerance": (
-            behavior_branch_mean_abs_log_ratio
-        ),
+        "branching_mean_abs_log_ratio_tolerance": (behavior_branch_mean_abs_log_ratio),
         "branching_mean_abs_log_ratio_within_diagnostic_tolerance": (
             sum(abs(value) for value in branching_log_ratios)
             / len(branching_log_ratios)
@@ -671,16 +669,16 @@ def _audit_pacman_logprob_alignment(
         "singleton_max_abs_tolerance": singleton_max_abs_tolerance,
     }
     behavior_compatible = (
-        (actor_reference_aligned or not require_actor_reference_alignment)
+        (not require_actor_reference_alignment or bool(actor_reference_aligned))
         and bool(kept_option_ratios)
         and would_filter_option_fraction <= behavior_max_filtered_fraction
-        and behavior_metrics["singleton_max_abs_logp"]
-        <= singleton_max_abs_tolerance
-        and behavior_metrics["transitivity_max_abs_residual"] <= 1.0e-7
+        and behavior_metrics["singleton_max_abs_logp"] <= singleton_max_abs_tolerance
+        and (
+            behavior_metrics["transitivity_max_abs_residual"] is None
+            or behavior_metrics["transitivity_max_abs_residual"] <= 1.0e-7
+        )
     )
-    accepted = (
-        exact_aligned if acceptance_mode == "exact" else behavior_compatible
-    )
+    accepted = exact_aligned if acceptance_mode == "exact" else behavior_compatible
     version_values = sorted({record["version"] for record in records})
     if len(version_values) != 1 or version_values[0] < 0:
         raise RuntimeError(
@@ -689,7 +687,9 @@ def _audit_pacman_logprob_alignment(
     report = {
         "accepted": accepted,
         "acceptance_mode": acceptance_mode,
+        "reference_available": reference_available,
         "require_actor_reference_alignment": require_actor_reference_alignment,
+        "actor_reference_aligned": actor_reference_aligned,
         "aligned": exact_aligned,
         "behavior_compatible": behavior_compatible,
         "global_step": global_step,
@@ -713,9 +713,7 @@ def _audit_pacman_logprob_alignment(
         "records": records,
     }
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(
-        output_dir, f"global-step-{global_step:06d}.json"
-    )
+    output_path = os.path.join(output_dir, f"global-step-{global_step:06d}.json")
     with open(output_path, "x", encoding="utf-8") as stream:
         json.dump(report, stream, indent=2, sort_keys=True)
         stream.write("\n")
@@ -726,10 +724,12 @@ def _audit_pacman_logprob_alignment(
         )
     logger.info(
         "MAAPACMAN_LOGPROB_ALIGNMENT_OK mode=%s exact=%s "
-        "behavior_compatible=%s global_step=%s tokens=%s report=%s",
+        "behavior_compatible=%s reference_available=%s global_step=%s "
+        "tokens=%s report=%s",
         acceptance_mode,
         exact_aligned,
         behavior_compatible,
+        reference_available,
         global_step,
         len(records),
         output_path,
@@ -1416,9 +1416,9 @@ class PPOTrainer:
                 "0",
             )
             if alignment_dir and global_step in alignment_steps:
-                if self.ref is None or not config.actor.should_compute_prox_logp():
+                if not config.actor.should_compute_prox_logp():
                     raise RuntimeError(
-                        "Pacman log-prob audit requires reference and proximal actor log-probs"
+                        "Pacman log-prob audit requires proximal actor log-probs"
                     )
                 acceptance_mode = os.getenv(
                     "MAAPACMAN_LOGPROB_ACCEPTANCE_MODE", "exact"
@@ -1432,9 +1432,7 @@ class PPOTrainer:
                 if acceptance_mode == "behavior":
                     rejection = config.actor.rejection_sampling
                     reward_norm = config.actor.reward_norm
-                    reward_contract = getattr(
-                        config, "reward_objective_contract", None
-                    )
+                    reward_contract = getattr(config, "reward_objective_contract", None)
                     episode_grpo_contract = (
                         reward_contract == "episode_return_group_v1"
                         and reward_norm is not None
@@ -1445,7 +1443,8 @@ class PPOTrainer:
                         and config.actor.adv_norm is None
                     )
                     unnormalized_option_contract = (
-                        reward_contract in {
+                        reward_contract
+                        in {
                             "step_local_raw_v1",
                             "option_return_raw_v1",
                         }
@@ -1469,10 +1468,7 @@ class PPOTrainer:
                         and not config.actor.use_sapo_loss
                         and not config.actor.use_cispo_loss
                         and config.actor.ppo_n_minibatches == 1
-                        and (
-                            episode_grpo_contract
-                            or unnormalized_option_contract
-                        )
+                        and (episode_grpo_contract or unnormalized_option_contract)
                         and config.critic is None
                         and config.teacher is None
                     )
@@ -1486,24 +1482,16 @@ class PPOTrainer:
                     output_dir=alignment_dir,
                     global_step=global_step,
                     max_abs_tolerance=float(
-                        os.getenv(
-                            "MAAPACMAN_LOGPROB_MAX_ABS_TOLERANCE", "1e-3"
-                        )
+                        os.getenv("MAAPACMAN_LOGPROB_MAX_ABS_TOLERANCE", "1e-3")
                     ),
                     mean_abs_tolerance=float(
-                        os.getenv(
-                            "MAAPACMAN_LOGPROB_MEAN_ABS_TOLERANCE", "1e-4"
-                        )
+                        os.getenv("MAAPACMAN_LOGPROB_MEAN_ABS_TOLERANCE", "1e-4")
                     ),
                     actor_reference_max_abs_tolerance=float(
-                        os.getenv(
-                            "MAAPACMAN_ACTOR_REF_MAX_ABS_TOLERANCE", "1e-5"
-                        )
+                        os.getenv("MAAPACMAN_ACTOR_REF_MAX_ABS_TOLERANCE", "1e-5")
                     ),
                     actor_reference_mean_abs_tolerance=float(
-                        os.getenv(
-                            "MAAPACMAN_ACTOR_REF_MEAN_ABS_TOLERANCE", "1e-6"
-                        )
+                        os.getenv("MAAPACMAN_ACTOR_REF_MEAN_ABS_TOLERANCE", "1e-6")
                     ),
                     acceptance_mode=acceptance_mode,
                     behavior_ratio_lower=behavior_ratio_lower,
@@ -1515,9 +1503,7 @@ class PPOTrainer:
                         )
                     ),
                     behavior_max_filtered_fraction=float(
-                        os.getenv(
-                            "MAAPACMAN_LOGPROB_MAX_FILTERED_FRACTION", "0.07"
-                        )
+                        os.getenv("MAAPACMAN_LOGPROB_MAX_FILTERED_FRACTION", "0.07")
                     ),
                     singleton_max_abs_tolerance=float(
                         os.getenv(
@@ -1527,7 +1513,9 @@ class PPOTrainer:
                     ),
                     require_actor_reference_alignment=os.getenv(
                         "MAAPACMAN_REQUIRE_ACTOR_REFERENCE_ALIGNMENT", "1"
-                    ).strip().lower()
+                    )
+                    .strip()
+                    .lower()
                     not in {"0", "false", "no"},
                     expected_option_tokens=int(
                         os.getenv("MAAPACMAN_EXPECTED_OPTION_TOKENS", "1")

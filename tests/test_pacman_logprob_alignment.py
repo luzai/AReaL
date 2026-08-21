@@ -9,9 +9,7 @@ from areal.trainer.rl_trainer import _audit_pacman_logprob_alignment
 from areal.utils.functional import apply_rejection_sampling
 
 
-def make_trajectory(
-    actor_delta: float = 0.0, behavior_logp_delta: float = 0.0
-):
+def make_trajectory(actor_delta: float = 0.0, behavior_logp_delta: float = 0.0):
     # Prompt rows 0/1; sampled tokens on rows 2/3. The actor/ref tensors are
     # already causal-position aligned, while rollout metadata is token aligned.
     return {
@@ -21,13 +19,9 @@ def make_trajectory(
         "prox_logp": torch.tensor(
             [[0.0, -0.25 + actor_delta + behavior_logp_delta, 0.0, 0.0]]
         ),
-        "ref_logp": torch.tensor(
-            [[0.0, -0.25 + behavior_logp_delta, 0.0, 0.0]]
-        ),
+        "ref_logp": torch.tensor([[0.0, -0.25 + behavior_logp_delta, 0.0, 0.0]]),
         "versions": torch.tensor([[-1, -1, 0, 0]]),
-        "pacman_allowed_token_ids": torch.tensor(
-            [[[0, 0], [0, 0], [21, 31], [22, 0]]]
-        ),
+        "pacman_allowed_token_ids": torch.tensor([[[0, 0], [0, 0], [21, 31], [22, 0]]]),
     }
 
 
@@ -139,10 +133,7 @@ def test_pacman_logprob_behavior_mode_accepts_bounded_masked_fraction(
     assert behavior["would_filter_fraction"] == pytest.approx(1 / 202)
     assert behavior["would_filter_option_count"] == 1
     assert behavior["would_filter_option_fraction"] == pytest.approx(1 / 101)
-    assert (
-        behavior["would_filter_option_fraction"]
-        < behavior["max_filtered_fraction"]
-    )
+    assert behavior["would_filter_option_fraction"] < behavior["max_filtered_fraction"]
 
 
 def test_pacman_behavior_audit_matches_runtime_sequence_mask(tmp_path) -> None:
@@ -281,11 +272,92 @@ def test_pacman_logprob_learned_mode_does_not_require_reference_match(
     assert not report["require_actor_reference_alignment"]
 
 
+def test_pacman_logprob_reference_free_mode_keeps_actor_audit(tmp_path) -> None:
+    trajectory = make_trajectory(behavior_logp_delta=0.03)
+    del trajectory["ref_logp"]
+
+    report = _audit_pacman_logprob_alignment(
+        [trajectory],
+        output_dir=str(tmp_path),
+        global_step=0,
+        acceptance_mode="behavior",
+        require_actor_reference_alignment=False,
+    )
+
+    assert report["accepted"]
+    assert not report["reference_available"]
+    assert report["actor_reference_aligned"] is None
+    assert set(report["metrics"]) == {"rollout_actor"}
+    assert "reference" not in report["records"][0]
+    assert "joint_reference_logp" not in report["options"][0]
+    assert report["behavior_metrics"]["transitivity_max_abs_residual"] is None
+
+
+def test_pacman_logprob_reference_free_behavior_still_fails_closed(
+    tmp_path,
+) -> None:
+    trajectory = make_trajectory(behavior_logp_delta=0.3)
+    del trajectory["ref_logp"]
+
+    with pytest.raises(RuntimeError, match="exceeded behavior acceptance limits"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            acceptance_mode="behavior",
+            behavior_max_filtered_fraction=0.0,
+            require_actor_reference_alignment=False,
+        )
+    stored = json.loads(
+        (tmp_path / "global-step-000000.json").read_text(encoding="utf-8")
+    )
+    assert not stored["accepted"]
+    assert stored["behavior_metrics"]["would_filter_option_count"] == 1
+
+
+def test_pacman_logprob_reference_free_exact_still_fails_closed(tmp_path) -> None:
+    trajectory = make_trajectory(actor_delta=0.1)
+    del trajectory["ref_logp"]
+
+    with pytest.raises(RuntimeError, match="exceeded exact acceptance limits"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            require_actor_reference_alignment=False,
+        )
+
+
+def test_pacman_logprob_reference_free_mode_is_explicit(tmp_path) -> None:
+    trajectory = make_trajectory()
+    del trajectory["ref_logp"]
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires reference log-probs when actor-reference alignment is enabled",
+    ):
+        _audit_pacman_logprob_alignment(
+            [trajectory], output_dir=str(tmp_path), global_step=0
+        )
+
+
+def test_pacman_logprob_rejects_mixed_reference_presence(tmp_path) -> None:
+    without_reference = make_trajectory()
+    del without_reference["ref_logp"]
+
+    with pytest.raises(RuntimeError, match="inconsistent reference log-probs"):
+        _audit_pacman_logprob_alignment(
+            [make_trajectory(), without_reference],
+            output_dir=str(tmp_path),
+            global_step=0,
+            require_actor_reference_alignment=False,
+        )
+
+
 def test_pacman_logprob_alignment_localizes_rtensors(tmp_path) -> None:
     trajectory = make_trajectory()
     trajectory = {
-        key: RTensor(shard=None, data=value)
-        for key, value in trajectory.items()
+        key: RTensor(shard=None, data=value) for key, value in trajectory.items()
     }
 
     report = _audit_pacman_logprob_alignment(
