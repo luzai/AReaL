@@ -11,24 +11,29 @@
 模型反复观察游戏，从当前状态的可行动作集合中选择动作，并从贯穿完整游戏轨迹逐步显现的后果中学习。我们的目标不只是最大化 Pacman
 分数，更是理解可靠训练长程视觉智能体所需的任务定义、反馈设计和系统支持。
 
-## 1. 动机：为何选择游戏，又为何从 Pacman 起步？
+## 1. 动机：Agentic RL 为什么要走向游戏
 
-游戏为研究此类智能体提供了天然试验场。它保留了长程交互的核心难点——每个动作都会改变未来的观察和结果——同时又具备明确的规则、可度量的结果以及可重置的环境。因此，游戏处于一个有益的中间地带：它比静态基准更具交互性，又比物理世界更可控、更易复现。
+[ARC Prize](https://arcprize.org/) 的 ARC-AGI-3 把静态谜题换成了一批不讲规则的陌生小游戏：规则得靠自己边玩边摸出来。图
+1 反映了我们先想让 Agentic RL 向游戏侧靠拢的理由——人类平均 170
+步左右就能连过七关，而目前最强的 AI 智能体不管多花多少步，通关数始终压在零上。它们缺的不是知识，也不是单轮推理能力，而是在一个随自己动作不断变化的环境里把一件事做完的能力。
 
-游戏作为 AI 试验平台的作用早已得到认可。[Arcade Learning Environment](https://arxiv.org/abs/1207.4708) 将
-Atari 游戏引入为评估通用智能体的公共平台。近年来，研究场景进一步扩展：Google DeepMind 的
-[SIMA](https://deepmind.google/blog/sima-generalist-ai-agent-for-3d-virtual-environments/)
-将屏幕图像和语言指令映射为多个 3D 游戏中的键盘与鼠标动作；OpenAI 的
-[Video PreTraining](https://openai.com/index/vpt/) 从游戏视频中学习 Minecraft
-行为，并针对需要长动作序列的任务进行微调。Microsoft Research 的
-[Muse](https://www.microsoft.com/en-us/research/blog/introducing-muse-our-first-generative-ai-model-designed-for-gameplay-ideation/)
-则采用另一条路线：从视觉帧和控制器动作中学习游戏动态，用于生成游戏过程和创意构思。这些项目解决的问题并不相同，但共同说明了为什么游戏适合作为研究感知、预测和行动模型的实验室。
+![The ARC-AGI-3 human–AI gap](../assets/figures/arcagi3_human_ai_gap.png)
 
-我们有意选择 Pacman 作为紧凑的起点。它的视觉场景和动作机制远比 Minecraft 或现代 3D 游戏简单，因此
-rollout、训练和诊断的成本更低。然而，完成一个迷宫仍可能需要数百个相互依赖的决策：每一步都会改变下一次观察和当前可用的选项，而最终结果可能取决于很久以前作出的决定。
+*图 1. ARC-AGI-3 上的通关数与总动作数：黄色是人类，绿色是当前最强的 AI 智能体。图片来源：[ARC
+Prize](https://arcprize.org/)。*
 
-这种紧凑性也让我们能够构建一个易于检查的实验环境。我们可以可复现地重置回合、捕获视觉观察、验证状态相关动作、记录结构化事件、重放失败过程，并创建新的迷宫变体。因此，Pacman
-不是最终目标，而是从静态 VLM 迈向长程视觉智能体的一座可控桥梁。
+整个领域的重心也正在往这里挪：大家不再只把静态数据集越堆越大，而是直接把智能体丢进类游戏环境里训练。小红书 dots studio 的
+[dots3-note Preview](https://studio.dots.ai/dots/dots3-en.html) 是 dots3
+系列第一个开放权重模型，它用强化学习在数千个全新交互环境中训练，学会自己探索、边做边更新记忆、在任务中途改变打法；在官方
+ARC-AGI-3 harness 上它以 6.9 分排在第一（图 2）。基准、模型、训练方法这几条线最近都指向同一类问题：一个智能体、一个会给出反馈的环境，还有一个要走很多步才结算的奖励。
+
+![ARC-AGI scores reported for dots3-note Preview](../assets/figures/dots3_arcagi_scores.png)
+
+*图 2. 即便是排在最前面的模型，在官方 ARC-AGI-3 harness 上也只有 6.9 分，Claude Opus 4.8 是
+1.5，GPT-5.5 是 0.4。表格摘自 dots studio 公布的评测结果；`*` 为其自测数据，`-` 表示未公布。*
+
+所以我们觉得，AReaL 也该在这个方向上迈一步了。底座其实大半已经就位：异步 rollout、PPO/GRPO、多模态训练都有；但现有示例基本是多轮交互和图像输入各走一边，也没有哪个示例把一个真正在跑的环境接进训练闭环。游戏智能体要求这些能力同时成立，还要额外处理随状态变化的动作合法性，以及跨几百步的信用分配。游戏是做这件事最可控的场地：规则写得清楚、结果能量化、回合随时可以重置。这篇文章是这个方向上的第一步，而不是一套已经成型的 Agentic RL
+框架；Pacman 则是我们故意挑的小切口——渲染一局开销很低、过程也便于逐帧复查，但要把一张迷宫吃干净，仍然需要几百个前后依赖的决策，早期一个拐错的弯就足以决定结局。
 
 ## 2. 问题定义
 
@@ -130,14 +135,14 @@ rollout，端到端过程——包括在各批 rollout 之间执行的优化器�
 
 ### 4.1 系统架构：MaaPacman 作为强化学习环境适配器
 
-理解图 1 最简单的方式是从左向右看。MaaPacman 的环境层位于强化学习工作流与具体的 Pacman 游戏实例之间。面向工作流，它提供 Gym
+理解图 3 最简单的方式是从左向右看。MaaPacman 的环境层位于强化学习工作流与具体的 Pacman 游戏实例之间。面向工作流，它提供 Gym
 风格的接口：`reset(seed)` 启动一个回合；`step(action)` 返回下一帧 RGB
 观测、基础奖励、终止或截断标志，以及结构化游戏元数据；`render()` 则提供当前帧。面向游戏，每个环境对象管理一个隔离的 `pacman-python`
 游戏实例。因此，工作流面对的是稳定的环境接口，而非游戏进程细节。
 
 ![MaaPacman–AReaL 运行时架构](../assets/figures/maapacman_areal_architecture.png)
 
-*图 1. 每个 MaaPacman 环境对象向强化学习工作流提供 Gym 风格的接口，并将动作交给一个隔离的 Pacman 游戏实例执行。rollout
+*图 3. 每个 MaaPacman 环境对象向强化学习工作流提供 Gym 风格的接口，并将动作交给一个隔离的 Pacman 游戏实例执行。rollout
 策略负责选择动作；FSDP actor 从成组轨迹中学习，从不直接控制游戏。*
 
 在 rollout 期间，工作流将 RGB 观测和当前依赖于状态的可行动作集合发送给策略。采用 Harness 介导的 option 策略时，它还会发送描述每个已公布
@@ -394,7 +399,7 @@ Iter31。
 
 ![选定的 256 步与 512 步谱系上的 Stage I 学习动态](../assets/figures/maapacman_stage1_learning_dynamics.png)
 
-*图 2。选定谱系先沿 Stage I-A 到达 Iter16，再进入其 Stage I-B 延续训练；Stage I-A 另行继续至 Iter49，图中未完整绘出。每个点聚合
+*图 4。选定谱系先沿 Stage I-A 到达 Iter16，再进入其 Stage I-B 延续训练；Stage I-A 另行继续至 Iter49，图中未完整绘出。每个点聚合
 48 个 rollout 回合。由于 rollout
 上限和奖励尺度不同，塑形奖励水平应在阶段内比较，而不应跨阶段比较。不同上限下的清除率仍可比较；更短的平均回合长度只有在出现胜局后才有意义。*
 
@@ -405,7 +410,7 @@ Iter31。
 
 ![在 50 个留出迷宫上的泛化](../assets/figures/maapacman_real50_generalization.png)
 
-*图 3。与基础模型相比，Iter25 取得了显著的配对提升。继续训练到 Iter31 并未提高严格通过数量。*
+*图 5。与基础模型相比，Iter25 取得了显著的配对提升。继续训练到 Iter31 并未提高严格通过数量。*
 
 | 模型            | 严格通过数 |   Wilson 95% CI | 平均剩余普通豆子数 |    简单 / 中等 / 困难 |
 | --------------- | ---------: | --------------: | -----------------: | --------------------: |

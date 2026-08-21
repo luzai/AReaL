@@ -17,41 +17,45 @@ trajectory. Our goal is not simply to maximize a Pacman score, but to understand
 task definition, feedback design, and systems support needed to train long-horizon
 visual agents reliably.
 
-## 1. Motivation: Why Games, and Why Start with Pacman?
+## 1. Motivation: Why Agentic RL Belongs in Games
 
-Games provide a natural playground for studying these agents. They retain the central
-difficulty of long-horizon interaction—each action changes future observations and
-outcomes—while providing explicit rules, measurable results, and resettable
-environments. Games therefore occupy a useful middle ground: they are more interactive
-than static benchmarks, but more controllable and repeatable than the physical world.
+[ARC Prize](https://arcprize.org/)'s ARC-AGI-3 replaces static puzzles with unfamiliar
+mini-games whose rules are never explained: the agent must learn them by playing. Figure
+1 is the whole argument for agentic RL in one picture. Humans clear seven levels in
+roughly 170 actions, while the best AI agents stay flat on the floor no matter how many
+actions they spend. What is missing is not knowledge or one-shot reasoning, but the
+ability to stay coherent in a world that answers back.
 
-This role of games as an AI testbed is well established. The
-[Arcade Learning Environment](https://arxiv.org/abs/1207.4708) introduced Atari games as
-a common platform for evaluating general agents. More recent work has expanded the
-setting: Google DeepMind's
-[SIMA](https://deepmind.google/blog/sima-generalist-ai-agent-for-3d-virtual-environments/)
-maps screen images and language instructions to keyboard and mouse actions across
-multiple 3D games, while OpenAI's [Video PreTraining](https://openai.com/index/vpt/)
-learns Minecraft behavior from gameplay videos and is fine-tuned for tasks requiring
-long sequences of actions. Microsoft Research's
-[Muse](https://www.microsoft.com/en-us/research/blog/introducing-muse-our-first-generative-ai-model-designed-for-gameplay-ideation/)
-takes a different direction by learning game dynamics from visual frames and controller
-actions for gameplay generation and ideation. These projects do not solve the same
-problem, but together they show why games are a useful laboratory for models that
-perceive, predict, and act.
+![The ARC-AGI-3 human–AI gap](../assets/figures/arcagi3_human_ai_gap.png)
 
-Pacman is an intentionally compact starting point. Its visual scene and action mechanics
-are far smaller than those of Minecraft or a modern 3D game, which makes rollout,
-training, and diagnosis more affordable. Yet completing a maze can still require
-hundreds of dependent decisions: each move changes the next observation and the
-currently available choices, while the final outcome may depend on decisions made much
-earlier.
+*Figure 1. Levels completed versus total actions taken on ARC-AGI-3. Yellow is human
+play; green is the best AI agent. Image credit: [ARC Prize](https://arcprize.org/).*
 
-Its compactness also lets us build an inspectable experimental environment. We can reset
-episodes reproducibly, capture visual observations, validate state-dependent actions,
-record structured events, replay failures, and create new maze variants. Pacman is
-therefore not the final destination, but a controlled bridge from a static VLM to a
-long-horizon visual agent.
+That gap is where the field has turned. Labs are no longer only scaling static datasets;
+they are training agents inside game-like worlds.
+[dots3-note Preview](https://studio.dots.ai/dots/dots3-en.html), the first open-weight
+model of Xiaohongshu (Rednote) dots studio's dots3 family, was RL-trained across thousands of novel
+interactive environments so that it explores, updates memory, and adapts mid-task—and it
+leads the official ARC-AGI-3 harness with 6.9 out of 100 (Figure 2). Benchmarks, model
+releases, and training recipes are converging on the same shape of problem: an agent, an
+environment that reacts, and a reward that only arrives many steps later.
+
+![ARC-AGI scores reported for dots3-note Preview](../assets/figures/dots3_arcagi_scores.png)
+
+*Figure 2. Even the leading model scores 6.9 on the official ARC-AGI-3 harness, against
+1.5 for Claude Opus 4.8 and 0.4 for GPT-5.5. Rows excerpted from dots studio's published
+evaluation table; `*` marks their own in-house runs, and `-` marks unreported entries.*
+
+We think it is time for AReaL to step into this domain. AReaL already supplies most of
+the substrate—asynchronous rollout, PPO/GRPO, multimodal training—but its reference
+examples exercise multi-turn interaction and image conditioning largely apart from each
+other, and none of them keeps a live environment in the loop. A game agent needs both at
+once, plus state-dependent action legality and credit assignment across hundreds of
+steps. Games are the most controllable place to build that: explicit rules, measurable
+outcomes, resettable episodes. This post is our first step in that direction rather than
+a finished agentic-RL framework, and Pacman is the deliberately small instance we start
+from—one maze is cheap to render and easy to inspect, yet clearing it still takes
+hundreds of dependent decisions in which an early wrong turn decides the outcome.
 
 ## 2. Problem Definition
 
@@ -207,7 +211,7 @@ Section 4.5 specifies the implemented contracts.
 
 ### 4.1 System architecture: MaaPacman as the RL environment adapter
 
-The simplest way to read Figure 1 is from left to right. MaaPacman's environment layer
+The simplest way to read Figure 3 is from left to right. MaaPacman's environment layer
 sits between the RL workflow and concrete Pacman game instances. Toward the workflow, it
 exposes a Gym-style interface: `reset(seed)` starts an episode, `step(action)` returns
 the next RGB observation, base reward, termination or truncation flags, and structured
@@ -217,7 +221,7 @@ therefore sees a stable environment interface rather than game-process details.
 
 ![MaaPacman–AReaL runtime architecture](../assets/figures/maapacman_areal_architecture.png)
 
-*Figure 1. Each MaaPacman environment object presents a Gym-style interface to the RL
+*Figure 3. Each MaaPacman environment object presents a Gym-style interface to the RL
 workflow and delegates actions to an isolated Pacman game instance. The rollout policy
 selects actions; the FSDP actor learns from grouped trajectories and never controls the
 game directly.*
@@ -571,7 +575,7 @@ normalization**. It produced Iter25 and Iter31.
 
 ![Stage I learning dynamics across the selected 256-step and 512-step lineage](../assets/figures/maapacman_stage1_learning_dynamics.png)
 
-*Figure 2. The selected lineage follows Stage I-A through Iter16 and then its Stage I-B
+*Figure 4. The selected lineage follows Stage I-A through Iter16 and then its Stage I-B
 continuation; Stage I-A continued separately to Iter49, which is not fully plotted. Each
 point aggregates 48 rollout episodes. Because rollout caps and reward scaling differ,
 shaped-reward levels should be compared within rather than across phases. Clear rate
@@ -587,7 +591,7 @@ checkpoint curve spanning both Stage I phases.
 
 ![Generalization across 50 held-out mazes](../assets/figures/maapacman_real50_generalization.png)
 
-*Figure 3. Iter25 produced a large paired improvement over the base model. Continuing to
+*Figure 5. Iter25 produced a large paired improvement over the base model. Continuing to
 Iter31 did not improve the strict pass count.*
 
 | Model           | Strict passes |   Wilson 95% CI | Mean normal pellets remaining |  Easy / medium / hard |
