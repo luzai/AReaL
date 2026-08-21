@@ -751,48 +751,26 @@ The 44/50 result shows transfer across maze layouts in safe mode. It does not sh
 general Pacman play. Turning on ghosts changes the dynamics, rewards, and failure modes.
 With the option policy, it also changes which options are available.
 
-### 6.5 A learning curve is not enough
+## 7. Conclusion
 
-Misaligned state-action metadata or an incomplete rollout can look like a policy
-failure. Keep trajectory records and mark which checkpoints actually finished. Without
-them, the curve is hard to interpret.
+Pacman is small, but it exposes the hard parts of long-horizon visual-agent RL:
+closed-loop perception, state-dependent admissible-action sets, credit assignment,
+rollout-training alignment, and distributed execution. MaaPacman provides a controlled,
+resettable game interface and a deterministic option harness. AReaL provides
+asynchronous rollouts and distributed multimodal training. Together, they form an
+end-to-end testbed for learning through extended visual interaction.
 
-## 7. Limitations and Next Steps
+In ghost-free safe mode, Iter25 and Iter31 each achieved 44/50 strict passes on held-out
+mazes; the base Qwen3.5-9B achieved 0/50. Stage II then verified that the ghost-enabled,
+constrained, episode-level GRPO pipeline runs end to end and provided an early transfer
+signal. The available evidence does not yet establish robust ghost-aware play.
 
-Several gaps remain in the current implementation and evidence:
+The optimizer is only one part of agentic RL. The action interface, rollout-training
+alignment, and reward-to-objective contract shape the optimization signal. Terminal
+evaluation is therefore essential for checkpoint selection and for distinguishing task
+success from proxy progress.
 
-1. **The policy does not use pixels alone.** The option policy receives a screenshot
-   plus authoritative metadata for the available options. This tests multimodal option
-   selection, not pixels-only control. Next, test two-frame or map-plus-local visual
-   input.
-1. **The 50-maze result is not ghost-aware.** In separate prototype runs, the
-   harness-mediated option policy completed ghost-enabled games. The reported 50-maze
-   suite disabled ghosts and fruit to isolate geometry. A ghost-aware suite should track
-   deaths, edible-ghost choices, and safety refusals.
-1. **The option harness is handcrafted.** Strategy families, target selection, routing,
-   and safety gates are rules rather than learned behavior. A longer-term goal is to
-   learn the policy and option generator together while keeping legality and safety
-   checks deterministic.
-1. **Coverage is still narrow.** Repeat training across multiple random seeds. Evaluate
-   Iter16, Iter25, and Iter31 on the same 50 mazes. Inspect the six mazes failed by both
-   Iter25 and Iter31 before training longer.
-1. **Reward comparisons need a matched ablation.** Hold initialization and budget fixed.
-   Then compare raw per-decision feedback, whole-episode normalization, raw option-span
-   feedback, and an episode objective with a small bounded local auxiliary. The
-   auxiliary is still only a proposal. Start with a fixed coefficient before trying
-   adaptive gradient balancing.
-
-## 8. Conclusion
-
-Pacman is small, but it exercises the hard parts of visual-agent RL: state-dependent
-actions, long episodes, delayed credit, rollout-training alignment, and distributed
-execution. MaaPacman provides a deterministic, resettable environment. AReaL provides
-asynchronous rollouts and distributed training.
-
-In safe mode, the trained policy solved 44 of 50 held-out mazes. The base model solved
-none. The experiments also showed that the latest checkpoint can be worse than an
-earlier one. Reward normalization changes the learning objective, not just the metric
-scale.
-
-Next, we will test controlled ghost dynamics and run matched ablations. We will keep a
-clear boundary between what the results show and what they do not.
+Next, we will run controlled ghost-aware evaluations across multiple seeds and matched
+reward-processing ablations. Longer term, we want the agent and its option harness to
+co-evolve by learning option generation and selection together, while keeping action
+legality and safety checks deterministic.
