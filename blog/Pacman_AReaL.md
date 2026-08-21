@@ -63,57 +63,56 @@ hundreds of dependent decisions in which an early wrong turn decides the outcome
 How can we train a vision-language model (VLM) to perceive, decide, and act in a
 long-horizon game through a sequence of grounded decisions?
 
-Unlike a static vision-language task, Pacman requires a closed interaction loop. Each
-model output changes the environment and therefore determines the next observation, the
-next admissible-action set, and the agent's eventual outcome. One game may contain
-hundreds of such dependent decisions.
+Unlike a static vision-language task, Pacman needs a closed interaction loop. Each model
+output changes the environment. It determines the next observation and admissible-action
+set. A game may contain hundreds of these linked decisions. Together, they determine the
+outcome.
 
 ### 2.1 Two policy settings
 
-We study two policy settings that differ in the action abstraction assigned to the
-model: a **primitive-action policy** and a **harness-mediated option policy**. In our
-experimental curriculum, Stage I pairs the primitive-action policy with a ghost-free
-environment, while Stage II pairs the harness-mediated option policy with ghost-enabled
-play. These stage labels describe the capability curriculum, not Pacman's numbered game
-levels. The staged design first isolates visual maze grounding and local navigation,
-then introduces dynamic hazards and higher-level objectives.
+We study two policy settings with different action abstractions: a **primitive-action
+policy** and a **harness-mediated option policy**.
 
-To keep the action terminology precise, we use **global action vocabulary** `V` for a
-fixed set of action identifiers, each represented by one output token, and
-**state-dependent admissible-action set** `A(s_t) ⊆ V` for the identifiers permitted at
-decision `t` by the environment or deterministic option harness. Constrained decoding
-restricts sampling to `A(s_t)`; we reserve **policy support** for the
-probability-theoretic set of actions assigned nonzero probability after the decoding
-rule is applied, rather than use it as another name for the admissible-action set.
-Throughout this post, the action vocabulary is fixed; the admissible-action set is what
-changes. For the primitive-action policy, `V` contains four direction identifiers. For
-the harness-mediated option policy, it is a fixed, bounded vocabulary of high-level
-option identifiers. In both cases, the policy must sample from the current `A(s_t)`
-rather than the full action vocabulary.
+Stage I uses the primitive-action policy in a ghost-free environment. Stage II uses the
+harness-mediated option policy with ghosts enabled. These stages describe the capability
+curriculum. They are not Pacman's numbered levels. Stage I isolates visual maze
+grounding and local navigation. Stage II adds dynamic hazards and higher-level
+objectives.
+
+The **global action vocabulary** `V` is a fixed set of action identifiers. Each
+identifier is represented by one output token. At decision `t`, the **state-dependent
+admissible-action set** `A(s_t) ⊆ V` contains the identifiers allowed by the environment
+or deterministic option harness. Constrained decoding restricts sampling to `A(s_t)`.
+The **policy support** is the set of actions with nonzero probability after the decoding
+rule is applied. It is not another name for the admissible-action set.
+
+Within each policy setting, `V` stays fixed. Only `A(s_t)` changes from one decision to
+the next. For the primitive-action policy, `V` contains four direction identifiers. For
+the harness-mediated option policy, `V` is a fixed, bounded vocabulary of high-level
+option identifiers. In both cases, constrained decoding restricts sampling to the
+current `A(s_t)`, not the full vocabulary.
 
 | Setting                            | Model output                                             | Admissible-action set at one decision                       | Execution unit                                     | Stage in this study      |
 | ---------------------------------- | -------------------------------------------------------- | ----------------------------------------------------------- | -------------------------------------------------- | ------------------------ |
 | **Primitive-action policy**        | One primitive-action identifier                          | Identifiers for directions open in the current state        | One primitive environment step                     | Stage I · ghost-free     |
 | **Harness-mediated option policy** | One identifier for a harness-generated high-level option | Identifiers for the options advertised in the current state | A bounded, revalidated sequence of primitive steps | Stage II · ghost-enabled |
 
-In the primitive-action policy, one model decision directly controls one game step.
-Constrained decoding removes directions that are blocked in the current state, but the
-model remains responsible for selecting the next low-level move.
+With the primitive-action policy, one model decision controls one game step. Constrained
+decoding removes directions that are blocked in the current state. The model still
+chooses the next low-level move.
 
-In the harness-mediated option policy, a deterministic option harness instantiates a
-small set of harness-generated high-level options from predefined strategy families:
-collect pellets, avoid danger, or pursue an edible ghost. Only the strategy families are
-predefined; each option's concrete target, route, and availability are recomputed from
-the current game state. We refer to each resulting choice as a **harness-generated
-high-level option**. Only identifiers for the currently advertised options enter
-`A(s_t)`.
+With the harness-mediated option policy, a deterministic option harness creates a small
+set of high-level options. The options come from predefined strategy families: collect
+pellets, avoid danger, or pursue an edible ghost. Only the strategy families are
+predefined. The harness recomputes each option's target, route, and availability from
+the current game state. We call each resulting choice a **harness-generated high-level
+option**. Only identifiers for the currently advertised options enter `A(s_t)`.
 
-After the model selects an advertised option, the option harness executes its primitive
-moves and checks after every step whether the option has completed or become invalid.
-This temporal action abstraction shifts the learned decision from **which direction
-should Pacman move next?** to **which high-level objective should Pacman pursue next?**
-Low-level route construction and safety validation remain deterministic parts of the
-option harness.
+After the model selects an advertised option, the harness executes its primitive moves.
+After each step, the harness checks whether the option is complete or invalid. This
+creates a temporal action abstraction. The model chooses Pacman's next high-level
+objective instead of Pacman's next direction. Low-level route construction and safety
+validation stay deterministic.
 
 Across both settings, the task requires:
 
@@ -130,27 +129,25 @@ Across both settings, the task requires:
 
 ## 3. Challenges
 
-### 3.1 Sparse reward cannot bootstrap missing perception and planning
+### 3.1 Sparse rewards alone cannot start learning without basic perception and planning
 
-Our earliest probes asked whether the base VLM could first recover the game state from
-pixels. On three real live-demo frames, it identified Pacman's exact row and column in
-`0/3` cases, recovered the complete `OPEN` and `BLOCKED` direction sets in `0/3`, and
-produced a valid 25-by-21 ASCII maze in `0/3`. Its mean absolute error when counting the
-remaining pellets was 48. The model could recognize the scene as Pacman while still
-failing to ground the state needed for control.
+We first tested whether the base VLM could recover the game state from pixels. On three
+frames from live demos, the model scored `0/3` on exact Pacman position, `0/3` on the
+complete `OPEN` and `BLOCKED` direction sets, and `0/3` on producing a valid 25-by-21
+ASCII maze. Its mean absolute error on the remaining-pellet count was 48. The model
+recognized the scene as Pacman but could not recover the state needed for control.
 
-This creates a cold-start problem for reinforcement learning. In an early strict
-image-only, no-training pilot, none of 32 rollouts completed the maze. Every episode ran
-to the step limit and produced the same negative episode return. With no within-group
-return variation, group-relative normalization would assign zero advantage to every
-sample and provide no policy-gradient signal. Increasing the rollout horizon cannot
-repair missing visual grounding or planning; it may only make the same uninformative
-trajectories longer and more expensive.
+This creates a cold-start problem for reinforcement learning. In an early image-only
+test of the untrained model, none of 32 rollouts completed the maze. Every episode
+reached the step limit and produced the same negative episode return. The returns did
+not vary within a group. Group-relative normalization would therefore assign zero
+advantage to every sample. It would provide no policy-gradient signal. A longer rollout
+horizon cannot fix missing visual grounding or planning. It may only produce longer and
+more expensive versions of the same uninformative trajectories.
 
-The seed-0 replay below gives a qualitative view of the resulting control failure. The
-original, untrained Qwen3.5-9B policy makes little useful progress and eventually
-terminates as `STUCK`. The replay illustrates the behavioral consequence of weak visual
-grounding and planning.
+The seed-0 replay below shows this failure in practice. The original, untrained
+Qwen3.5-9B policy makes little useful progress. The episode eventually terminates as
+`STUCK`. This behavior reflects weak visual grounding and planning.
 
 <div align="center">
   <video src="https://github.com/user-attachments/assets/2745b846-65d1-47a2-be22-8b79ee217ca1" controls preload="metadata" playsinline width="72%" poster="../assets/demos/pacman-base-seed0-poster.png"></video>
@@ -158,85 +155,83 @@ grounding and planning.
   <a href="../assets/demos/pacman-base-seed0.mp4">Download MP4</a>
 </div>
 
-This cold-start barrier motivates a curriculum-learning-like progression: introduce
-visual grounding, local action selection, and longer-horizon planning in stages rather
-than demand full-game competence from the initial policy.
+This cold-start barrier motivates a curriculum. We introduce visual grounding, local
+action selection, and longer-horizon planning in stages. This lets the initial policy
+learn these skills before it attempts the full game.
 
 ### 3.2 Long feedback cycles and GPU memory requirements
 
-Consider an experimental run with 49 optimizer updates, each requiring 48 rollout
-episodes. From the first rollout of Iter1 to the last rollout of Iter49, the end-to-end
-process—including the optimizer updates performed between rollout batches—took 46.21
-hours.
+One run had 49 optimizer updates. Each update used 48 rollout episodes. From the first
+rollout of Iter1 to the last rollout of Iter49, the run took 46.21 hours end to end.
+This time includes the optimizer updates between rollout batches.
 
-If the architecture or experimental design contains a subtle bug, the learning curve may
-not reveal it for many hours, by which point substantial compute has already been spent.
+A subtle bug in the architecture or experiment design may not appear in the learning
+curve for many hours. By then, the run may have used substantial compute.
 
-The experiments also have substantial GPU memory requirements. The vLLM rollout engine,
-FSDP actor, and optional reference model share the available compute and memory on the
-same 8-GPU node. Long rollout episodes also increase trajectory-storage and
-log-probability costs. Model offloading, memory-aware batching, distributed trajectory
-processing, and checkpoint retention are therefore part of the training design, not
-optional infrastructure polish.
+These experiments also need substantial GPU memory. The vLLM rollout engine, FSDP actor,
+and optional reference model share compute and memory on the same 8-GPU node. Long
+rollout episodes need more trajectory storage. They also increase the cost of
+log-probability computation. We therefore treat model offloading, memory-aware batching,
+distributed trajectory processing, and checkpoint retention as required parts of the
+training design.
 
-### 3.3 Admissible actions are not enough for correct training
+### 3.3 Rollout and training must use the same recorded action mask and temperature
 
-Constrained decoding keeps model output inside the current state-dependent
-admissible-action set. But a rollout containing only admissible actions can still lead
-to an incorrect PPO update if rollout and training use different admissible-action sets
-or temperatures to score the chosen action.
+Constrained decoding keeps each sampled output inside the current state-dependent
+admissible-action set. A rollout can still produce a wrong PPO update even when every
+executed action is admissible. This happens when rollout and training use different
+admissible-action sets or temperatures to score the chosen action.
 
-PPO can then mistake a bookkeeping mismatch for a policy change. Valid samples may be
-clipped or rejected, and training may update inadmissible actions—even though every
-executed action was admissible and the loss remains finite. Section 4.3 gives the
-precise formulation and implementation contract.
+PPO may treat this scoring mismatch as a policy change. Valid samples may then be
+clipped or rejected. Training may also send gradients into inadmissible-action logits.
+These failures can occur even when every executed action is admissible and the loss is
+finite. Section 4.3 shows how we keep rollout and training probabilities aligned.
 
-### 3.4 Credit assignment has two axes: timescale and episode weight
+### 3.4 Feedback timescale and episode weight are separate choices
 
-Long-horizon learning raises two related but distinct questions: what learning signal
-should each decision receive, and how much total optimization weight should each episode
-receive?
+Long-horizon learning has two separate design choices. Feedback timescale determines
+what signal each decision receives. Episode weighting determines how much total
+optimization weight each episode receives.
 
-Episode-level feedback aligns learning with the whole-game outcome but gives every
-decision in an episode the same coarse task signal. Step- or option-level feedback is
-more precise in time, but may miss consequences that appear later. These feedback
-timescales are complementary rather than interchangeable.
+Episode-level feedback aligns learning with the whole-game outcome. It gives every
+decision in the episode the same coarse task signal. Step- or option-level feedback is
+more precise in time, but it may miss consequences that appear later. These feedback
+timescales are complementary, not interchangeable.
 
-Separately, a flat mean over trained tokens can give a longer trajectory more influence
-simply because it contains more model decisions. The objective must therefore preserve
-the intended feedback timescale without letting episode length determine episode weight.
-Section 4.5 specifies the implemented contracts.
+Episode weighting is a separate issue. A flat mean over trained tokens gives longer
+trajectories more influence because they contain more model decisions. The objective
+should preserve the intended feedback timescale. It should not let episode length
+determine episode weight. Section 4.5 shows how we handle both choices in the objective.
 
 ## 4. Method
 
 ### 4.1 System architecture: MaaPacman as the RL environment adapter
 
-The simplest way to read Figure 3 is from left to right. MaaPacman's environment layer
-sits between the RL workflow and concrete Pacman game instances. Toward the workflow, it
-exposes a Gym-style interface: `reset(seed)` starts an episode, `step(action)` returns
-the next RGB observation, base reward, termination or truncation flags, and structured
-game metadata, and `render()` exposes the current frame. Toward the game, each
-environment object manages an isolated `pacman-python` game instance. The workflow
-therefore sees a stable environment interface rather than game-process details.
+Figure 3 shows the flow from left to right. MaaPacman sits between the RL workflow and
+each Pacman game instance. It exposes a Gym-style API to the workflow. `reset(seed)`
+starts an episode. `step(action)` returns the next RGB observation, base reward,
+termination and truncation flags, and structured game metadata. `render()` returns the
+current frame. Each environment object manages one isolated `pacman-python` game
+instance. The workflow does not need to handle game-process details.
 
 ![MaaPacman–AReaL runtime architecture](../assets/figures/maapacman_areal_architecture.png)
 
-*Figure 3. Each MaaPacman environment object presents a Gym-style interface to the RL
-workflow and delegates actions to an isolated Pacman game instance. The rollout policy
-selects actions; the FSDP actor learns from grouped trajectories and never controls the
-game directly.*
+*Figure 3. Each MaaPacman environment object gives the RL workflow a Gym-style
+interface. It sends actions to one isolated Pacman game instance. The rollout policy
+selects actions. The FSDP actor learns from grouped trajectories but does not control
+the game.*
 
-During rollout, the workflow sends the RGB observation and current state-dependent
-admissible-action set to the policy. Under the harness-mediated option policy, it also
-sends metadata describing each advertised option. The policy returns an action
-identifier; the environment or option harness resolves it to the corresponding primitive
-action or grounded option. The figure uses the legacy label “legal option support”; in
-this post, that label denotes `A(s_t)`, not policy support. The environment returns game
-events and terminal state; the `areal-pacman` workflow applies the experiment-specific
-reward function and assembles the interaction records into grouped trajectories. AReaL
-trains on those trajectories and publishes updated weights back to the rollout policy.
+During rollout, the workflow sends the RGB observation and current admissible-action set
+to the policy. For the option policy, it also sends metadata for each available option.
+The policy returns an action identifier. The environment or option harness maps that
+identifier to a primitive action or grounded option. In Figure 3, “legal option support”
+means the state-dependent admissible-action set `A(s_t)`, not policy support. After the
+action, the environment returns game events and terminal state. The `areal-pacman`
+workflow applies the experiment reward and groups the interaction records into
+trajectories. AReaL trains on those trajectories and sends updated weights back to the
+rollout policy.
 
-This conceptual split maps to the repositories as follows:
+The four repositories divide the work as follows:
 
 | Repository      | Responsibility                                                                                                                                    | Deliberate boundary                                       |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
@@ -245,87 +240,84 @@ This conceptual split maps to the repositories as follows:
 | `areal-pacman`  | Environment-to-AReaL workflow, prompts, reward function, configuration, evaluation, and experiment records                                        | Experiment semantics; no generic FSDP/vLLM implementation |
 | `AReaL`         | Asynchronous rollout, PPO/GRPO, vLLM, FSDP, checkpointing, distributed data movement, and our training-side constrained-log-probability extension | No game-environment or option-generation logic            |
 
-This layout lets us test game events, reward semantics, and distributed policy updates
-independently. It also prevents a common architecture error: drawing a direct control
-edge from the training actor to the game.
+This split lets us test game events, rewards, and distributed policy updates separately.
+It also makes the control flow clear. The rollout policy acts in the game. The training
+actor only updates weights.
 
 ### 4.2 Harness-mediated option policy: let the model choose intent
 
-Under the harness-mediated option policy, the model selects a high-level intent rather
-than an individual movement direction. At each decision point, the deterministic option
-harness instantiates a bounded set of state-valid choices from three predefined strategy
-families:
+With the harness-mediated option policy, the model chooses a high-level goal instead of
+one movement direction. At each decision, the deterministic harness creates a bounded
+set of options that are valid in the current state. The options come from three fixed
+strategy families:
 
 - **Collect pellets:** move toward an approved pellet target;
 - **Avoid danger:** move toward a safe escape anchor;
 - **Pursue an edible ghost:** approach a vulnerable ghost.
 
-Each instantiated option includes a target, first primitive action, bounded commitment,
-and safety metadata. The VLM selects one option identifier from the current
-admissible-action set; it does not emit a precomputed action list. The deterministic
-harness uses breadth-first search (BFS) over the maze topology and handcrafted safety
-checks to ground that intent into primitive moves. `COLLECT`, `AVOID`, and `ELIMINATE`
-options are capped at `min(8, d)`, `min(3, d)`, and `min(6, d)` steps, respectively,
-where `d` is the current shortest-path distance. After every environment step, the
-harness recomputes and revalidates the selected strategy and target, stopping on
-completion, invalidation, episode termination or truncation, or the commitment cap. The
-result is a bounded, revalidated action chunk rather than blind replay of a fixed route.
+Each option has a target, a first primitive action, a step limit, and safety metadata.
+The VLM chooses one option identifier from the current admissible-action set. It does
+not output a fixed action list. The harness uses breadth-first search (BFS) and
+handcrafted safety checks to turn the option into primitive moves. `COLLECT`, `AVOID`,
+and `ELIMINATE` have step caps of `min(8, d)`, `min(3, d)`, and `min(6, d)`. Here, `d`
+is the current shortest-path distance. After every environment step, the harness
+recomputes and checks the strategy and target. It stops when the option finishes,
+becomes invalid, reaches its cap, or the episode ends or is truncated. It never blindly
+replays a fixed route.
 
-Empirically, each model-selected option controlled **1.49 primitive environment steps**
-on average, compared with one step per decision under primitive-action control. This
-shows that the deterministic harness can reduce model-call frequency by expanding one
-high-level choice into a bounded, revalidated action chunk. The realized saving was
-modest because most `COLLECT` options targeted a nearby pellet and ended after one step.
+In our runs, one model-selected option covered **1.49 primitive environment steps** on
+average. Primitive-action control covered one step per model decision. The harness
+therefore reduced the number of model calls. The reduction was modest because most
+`COLLECT` options targeted a nearby pellet and stopped after one step.
 
-This division of labor is intentional. The option harness owns deterministic legality
-checks, route construction, and safety validation; the learned policy decides which
-advertised harness-generated high-level option is most useful in the current visual
-context. It reduces the number of model decisions without turning the policy into a
-hand-coded Pacman solver.
+The harness checks legality, builds routes, and enforces safety rules. The learned
+policy chooses which available high-level option best fits the current visual state.
+This reduces model calls without hard-coding the full Pacman policy.
 
 ### 4.3 Constraint alignment across rollout and training
 
 At decision `t`, let `A_t = A(s_t) ⊆ V` be the recorded state-dependent
 admissible-action set. Constrained decoding renormalizes the rollout policy over `A_t`
 at temperature `T`. [AReaL's decoupled PPO objective](https://arxiv.org/abs/2505.24298)
-distinguishes the vLLM rollout behavior policy `π_behav`, the pre-update proximal policy
-`π_prox`, and the current actor policy `π_θ` before applying the
+tracks three policies. `π_behav` is the vLLM rollout policy. `π_prox` is the actor
+before the update. `π_θ` is the current actor. AReaL then applies the
 [clipped PPO update](https://arxiv.org/abs/1707.06347). The behavior-correction ratio
-directly tests whether rollout and training score the recorded choice consistently:
+compares how rollout and training score the recorded action:
 
 ```math
 w_t = \frac{\pi_{\mathrm{prox}}(a_t \mid s_t,A_t;T)}
            {\pi_{\mathrm{behav}}(a_t \mid s_t,A_t;T)}.
 ```
 
-When the behavior and proximal parameters match, consistent normalization gives
-`w_t = 1`. If rollout and training instead use different admissible-action sets or
-temperatures, the ratio can deviate from one even when the model parameters match. This
-is a normalization error, not policy staleness: it creates spurious importance weights,
-can reject or clip valid samples, and sends gradient into inadmissible logits.
+When `π_behav` and `π_prox` have the same parameters and use the same `A_t` and `T`,
+`w_t = 1`. If rollout and training use different admissible-action sets or temperatures,
+`w_t` can differ from one even when the model parameters match. This mismatch is a
+normalization error, not policy staleness. It creates false importance weights. It can
+reject or clip valid samples and send gradients into inadmissible logits.
 
-[Huang and Ontañón](https://arxiv.org/abs/2006.14171) study the analogous case of
-sampling from a masked distribution while computing policy-gradient updates from the
-unmasked distribution, which they call **naive invalid action masking**. In their PPO
-experiments, this inconsistency produced substantially higher KL divergence and more
-variable convergence than consistent masking.
+[Huang and Ontañón](https://arxiv.org/abs/2006.14171) study a similar mismatch. Their
+agent samples actions from a masked distribution but computes policy-gradient updates
+from the unmasked distribution. They call this **naive invalid action masking**. In
+their PPO experiments, this mismatch caused higher KL divergence and less stable
+convergence than consistent masking.
 
 At rollout time, the workflow maps the identifiers in `A_t` to exact tokenizer IDs. A
 small AReaL request adapter forwards them to vLLM's built-in `allowed_token_ids`, which
 masks other tokens before sampling. The rollout stores the sampled token, temperature,
-constrained behavior log-probability `log π_behav`, and exact `A_t` together so they
-remain aligned through distributed batching.
+constrained behavior log-probability `log π_behav`, and exact `A_t` in the same record.
+This keeps them aligned during distributed batching.
 
-Before an update, the FSDP actor recomputes `log π_prox`; during the PPO forward pass,
-it evaluates `log π_θ`. Neither operation decodes. Both renormalize the actor's logits
-over the recorded `A_t`. When KL regularization is enabled, the reference policy `π_ref`
-uses the same set and temperature, although it is not a denominator of the PPO ratio.
-These distributions need not be equal because their parameters or versions may differ;
-their admissible-action set and normalization rule must match.
+Before an update, the FSDP actor recomputes `log π_prox`. During the PPO forward pass,
+it computes `log π_θ`. These operations score the recorded action. They do not generate
+a new action. Both normalize the actor logits over the recorded `A_t`. When KL
+regularization is enabled, `π_ref` uses the same set and temperature. `π_ref` is not a
+denominator in the PPO ratio. The policies may assign different probabilities because
+their parameters or versions differ. However, they must use the same admissible-action
+set and normalization rule.
 
-Applying an action mask during rollout is not enough: every log-probability used by the
-rollout behavior, proximal actor, current actor, and reference policy (when enabled)
-must be computed with the same recorded admissible-action set and temperature.
+Masking actions only during rollout is not enough. Every log-probability must use the
+recorded admissible-action set and temperature. This rule applies to the rollout
+behavior policy, proximal actor, current actor, and optional reference policy.
 
 ### 4.4 Reward design: learn from events, not raw score
 
@@ -358,45 +350,46 @@ c_t = 1-\rho_t,
 ```
 
 Here, $m_t$ is the number of normal pellets remaining after step $t$, and $m_0$ is the
-initial count. The progress term is omitted when the same step already collects a normal
-pellet, avoiding double payment for one event. Scaling by $c_t$ makes the guidance
-strongest late in the game, when only a few pellets remain. An invalid or unparsable
-action response instead received `-50` for that model decision and ended the episode.
+initial count. If a step already collects a normal pellet, we omit the progress term.
+This avoids rewarding the same event twice. The factor $c_t$ makes the progress reward
+strongest late in the game, when few pellets remain. An invalid or unparsable response
+gives that model decision `-50` and ends the episode.
 
-The Stage I-B primitive-action continuation kept the same event-level reward family and
-fixed step cost, but used raw per-decision feedback without reward or advantage
-normalization. Ghost, death, and safety-refusal terms belong to ghost-enabled training
-configurations; they should not be read into the ghost-free primitive-action results.
+Stage I-B kept the same event rewards and fixed step cost. It used raw feedback for each
+decision, with no reward or advantage normalization. Stage I-B remained ghost-free.
+Ghost, death, and safety-refusal rewards appear only in the ghost-enabled
+configurations.
 
 This shaped reward is a training signal, not the success criterion. Strict level
 completion and held-out success remain the primary evaluation metrics.
 
 ### 4.5 From environment rewards to the policy objective
 
-The reward function defines what feedback the environment produces; the objective
-contract defines how that feedback is assigned, normalized, and reduced into an update.
-These are separate design choices with three independent dimensions.
+The reward function defines the feedback from the environment. The objective contract
+defines how training assigns, normalizes, and reduces that feedback. We describe the
+objective contract along three dimensions: feedback timescale, normalization, and
+episode weighting.
 
-**Feedback timescale.** A decision can receive the reward from its immediate environment
-step, or, for a harness-generated high-level option, the sum over that option's
-committed execution span:
+**Feedback timescale.** A decision can receive the reward from its next environment
+step. A high-level option can instead receive the sum of rewards over its committed
+execution span:
 
 ```math
 R^{\text{option}}_{e,j}
 = \sum_{t\in\text{committed span}(e,j)} r_{e,t}.
 ```
 
-Both choices provide temporally local feedback and do not propagate consequences beyond
-the scored step or option. An option-span return is therefore a local score, not a
-counterfactual or state-conditioned advantage. At the episode timescale, all shaped step
-rewards are instead summed over one rollout episode:
+Both signals are temporally local. They do not assign credit for events after the scored
+step or option. An option-span return is still a local return. It is not a
+counterfactual or state-conditioned advantage. For an episode-level signal, we instead
+sum all shaped step rewards in one rollout episode:
 
 ```math
 R_e=\sum_t r_{e,t}.
 ```
 
-The resulting episode signal preserves the whole-episode objective, but assigns the same
-coarse task signal to every model decision in that episode.
+This signal preserves the whole-episode objective. Every model decision in the episode
+receives the same coarse task signal.
 
 **Normalization.** A local or episode-level signal may be used raw or normalized. In the
 episode-level group-relative contract, returns sampled from the same initial prompt are
@@ -407,9 +400,9 @@ G_e=\frac{R_e-\mu_{\text{prompt}}}
 {\sigma_{\text{prompt}}+10^{-5}}.
 ```
 
-Normalizing a local signal changes its scale or comparison group, not its feedback
-timescale. Likewise, episode aggregation retains the sum of intermediate rewards but
-discards where within the episode they occurred.
+Normalizing a local signal changes its scale or comparison group. It does not change the
+feedback timescale. Episode aggregation preserves each reward's contribution to the
+total but discards when it occurred.
 
 **Episode weighting.** Loss is averaged within each rollout episode before episodes are
 averaged:
@@ -420,50 +413,47 @@ L=\frac{1}{|E|}\sum_{e\in E}
 ```
 
 Here, $N_e$ is the number of valid trained action tokens in rollout episode $e$. This
-reduction prevents length alone from increasing an episode's intended weight: a
-200-decision rollout's token losses and a 50-decision rollout's token losses are each
-averaged within their own episode. The data pipeline preserves episode boundaries and
-encoded admissible-action sets while balancing token load across workers.
+prevents a long episode from receiving more weight only because it has more trained
+tokens. For example, the token losses from a 200-decision episode and a 50-decision
+episode are averaged within their own episodes. The data pipeline keeps episode
+boundaries and encoded admissible-action sets. It also balances token load across
+workers.
 
 ### 4.6 What AReaL provides, and what Pacman required
 
-[AReaL](https://github.com/inclusionAI/AReaL) provides the distributed RL substrate:
-asynchronous agent rollouts, PPO/GRPO optimization, inference and training workers,
-checkpointing, generic multi-turn agent workflows, and multimodal rollout and training
-support. Its reference examples expose the last two capabilities mostly separately: the
-multi-turn example is a text-only GSM8K retry loop, whereas `VisionRLVRWorkflow`
-performs a single image-conditioned generation per episode.
+[AReaL](https://github.com/inclusionAI/AReaL) provides asynchronous rollout, PPO/GRPO,
+distributed inference and training, checkpointing, multi-turn workflows, and multimodal
+support. Its reference examples show multi-turn interaction and image input separately.
+The GSM8K retry loop is text-only. `VisionRLVRWorkflow` uses one image-conditioned
+generation per episode.
 
-MaaPacman combines these capabilities in an interactive visual-control workflow. At each
-fresh model decision, the environment renders the current game state and packages
-exactly one fresh PNG with the prompt, while the native workflow preserves the
-corresponding VLM processor outputs through rollout and training. Under the
-harness-mediated option policy, one selected option may execute several primitive
-environment steps before the next model call. The precise contract is therefore one
-fresh image per model turn, not one image per environment step.
+MaaPacman combines multi-turn interaction with image input. Before each model decision,
+it renders the current game state and adds one fresh PNG to the prompt. AReaL keeps the
+matching VLM processor outputs through rollout and training. One selected option may
+then run for several primitive environment steps before the next model call. The model
+therefore receives one fresh image per decision, not per environment step.
 
-The integration also carries each state's admissible-action set from rollout into actor
-and reference log-probability computation, keeping the constrained policy consistent
-across generation and training. It preserves environment-episode identity through
-distributed batching, enabling equal-episode loss weighting even when trajectories have
-different lengths, and adds the operational support needed for long episodes,
-variable-duration options, VLM memory pressure, checkpoint retention, and reproducible
+The integration passes each state's admissible-action set from rollout to the actor and
+reference-policy log-probability calculations. This keeps the constrained policy
+definition the same during generation and training. It also preserves episode identity
+during distributed batching. This lets episodes receive equal loss weight even when
+their trajectories have different lengths. The integration also supports long episodes,
+variable-length options, VLM memory use, checkpoint retention, and reproducible
 experiment records.
 
-Together, these changes make our AReaL-based stack capable of training a Pacman agent
-with state-dependent admissible actions. The current interface remains Pacman-specific
-rather than a generic constrained-agent API.
+Together, these changes let our AReaL-based stack train a Pacman agent with
+state-dependent admissible actions. The current interface is still specific to Pacman.
+It is not yet a general API for constrained agents.
 
 ## 5. Experimental Results
 
 ### Experimental overview
 
-We followed a staged curriculum rather than train the full ghost-aware task from
-scratch. Stage I learned ghost-free primitive-action navigation in two related phases:
-Stage I-A bootstrapped the policy with a 256-step cap and selected Iter16, while Stage
-I-B continued from that checkpoint with a 512-step cap and evaluated maze
-generalization. Stage II transferred the selected Stage I policy to a ghost-enabled,
-harness-mediated option policy and validated the whole-episode training path.
+We used a staged curriculum instead of training the full ghost-aware task from scratch.
+Stage I learned ghost-free primitive-action navigation in two phases. Stage I-A used a
+256-step cap and selected Iter16. Stage I-B started from Iter16, raised the cap to 512
+steps, and tested maze generalization. Stage II enabled ghosts and switched to a
+harness-mediated option policy. It also tested the whole-episode training path.
 
 #### Stage setup
 
@@ -474,44 +464,41 @@ harness-mediated option policy and validated the whole-episode training path.
 | **Stage II probe**      | Ghost-enabled | Harness-mediated option | Base Qwen3.5-9B and Iter25    |         512 |
 | **Stage II validation** | Ghost-enabled | Harness-mediated option | Iter25 actor and KL reference |         512 |
 
-We keep the same decoding settings throughout: `temperature=0.7` for training rollouts
-and greedy decoding for evaluation.
+Training rollouts used `temperature=0.7`. Evaluations used greedy decoding.
 
-#### Objective and evidence
+#### What each stage tests
 
-| Phase                   | Reward-to-objective contract                                   | Main evidence                      | Evidence scope              |
-| ----------------------- | -------------------------------------------------------------- | ---------------------------------- | --------------------------- |
-| **Stage I-A**           | Temporally local per-decision feedback (no episode-level GRPO) | Iter16 selected over Iter49        | Checkpoint selection        |
-| **Stage I-B**           | Temporally local per-decision feedback (no episode-level GRPO) | Iter25/31; 44/50 held-out mazes    | Ghost-free maze transfer    |
-| **Stage II probe**      | No training                                                    | Iter25 `8/12` vs. base `2/12`      | Preliminary transfer signal |
-| **Stage II validation** | Episode-level group-relative objective (GRPO)                  | Three updates completed end to end | Training-path validation    |
+| Phase                   | Training signal                                         | Main result                        | What it shows               |
+| ----------------------- | ------------------------------------------------------- | ---------------------------------- | --------------------------- |
+| **Stage I-A**           | Local feedback for each decision; no episode-level GRPO | Iter16 selected over Iter49        | Checkpoint selection        |
+| **Stage I-B**           | Local feedback for each decision; no episode-level GRPO | Iter25/31; 44/50 held-out mazes    | Ghost-free maze transfer    |
+| **Stage II probe**      | No training                                             | Iter25 `8/12` vs. base `2/12`      | Early transfer signal       |
+| **Stage II validation** | Episode-level group-relative objective (GRPO)           | Three updates completed end to end | The full training loop runs |
 
-Both Stage I phases used temporally local per-decision feedback rather than the
-whole-episode group-relative objective used in the bounded Stage II validation. Here,
-“local” describes the **credit-assignment timescale**. It does not mean that the
-observation is local or partial—the model receives an up-to-date maze image at every
-decision.
+Both Stage I phases trained each decision from temporally local feedback. Stage II
+validation instead used one group-relative signal for the whole episode. Here, “local”
+refers to the **credit-assignment timescale**. It does not describe the observation. The
+model still receives the current maze image at every decision.
 
 ### 5.1 Stage I: Ghost-free primitive-action navigation
 
-Both Stage I phases ask the model to perceive the maze from the current screenshot and
-choose one admissible primitive direction at each decision. Stage I-B continues from the
-checkpoint selected in Stage I-A and extends the rollout horizon. We report them as
-related phases, not as one causal learning curve.
+In both Stage I phases, the model reads the current maze image and chooses one
+admissible primitive direction. Stage I-B starts from Iter16 and uses a longer rollout
+cap. It also changes reward processing. The two phases are one staged lineage, not a
+controlled causal comparison.
 
 #### Stage I-A: 256-step bootstrapping and checkpoint selection
 
-This phase used Qwen3.5-9B, a 256-step rollout cap, and single-token primitive-direction
-actions constrained to the directions open in the current state. It used the temporally
-local feedback described above and did not use the whole-episode, equal-episode contract
-in Section 4.5.
+Stage I-A used Qwen3.5-9B and a 256-step rollout cap. Each action was one
+primitive-direction token. The action had to match a direction that was open in the
+current state. Training used local feedback for each decision. It did not use the
+whole-episode signal or equal-episode loss weighting from Section 4.5.
 
-Each update collected 48 rollout episodes from four prompt rows with 12 episodes per
-prompt, sampled at temperature 0.7 on one 8-GPU node. Every rollout episode collected
-before a completed update reached the 256-step cap, so terminal evaluation was necessary
-to distinguish a useful checkpoint from one with merely high shaped reward. We completed
-49 optimizer updates. Terminal evaluation selected Iter16 rather than the latest
-checkpoint.
+Each update sampled 48 episodes at temperature 0.7 on one 8-GPU node. We used four
+prompt rows and collected 12 episodes from each row. For every completed update, all 48
+episodes reached the 256-step cap. Training rollouts alone could not show which
+checkpoints could finish the maze. We therefore used terminal evaluation after 49
+optimizer updates. It selected Iter16 instead of the latest checkpoint.
 
 | Checkpoint      | Mean shaped reward in its rollout batch | Greedy wins on seeds 0, 1, 2 | Mean normal-pellet clear rate |
 | --------------- | --------------------------------------: | ---------------------------: | ----------------------------: |
@@ -519,21 +506,20 @@ checkpoint.
 | Iter16          |                               **150.7** |                      **3/3** |                    **100.0%** |
 | Iter49          |                                   120.3 |                          0/3 |                         92.2% |
 
-These three deterministic replays on one maze are a checkpoint-selection diagnostic, not
-a success-rate estimate. Iter49 retained 92.2% mean pellet clearance but recorded 0/3
-terminal wins. The later checkpoint therefore preserved much of the local shaped proxy
-without preserving terminal reliability; neither training reward nor “percent cleared”
-should replace checkpoint evaluation on the actual terminal objective.
+We used these three deterministic runs on one maze only to choose a checkpoint. They are
+too few to estimate a general success rate. Iter49 still cleared 92.2% of pellets on
+average, but it won 0/3 runs. It looked strong on local proxy metrics but did not finish
+the maze. Checkpoint selection must therefore use terminal wins, not training reward or
+pellet-clear percentage alone.
 
-The 256-step cap applied only when collecting rollouts for training: each training
-episode was truncated after 256 environment steps, limiting exposure to late-game
-states. Evaluation did not use this 256-step cap, so the policy could continue acting
-past step 256 until the episode ended. For example, one successful Iter16 evaluation
-cleared the maze after 666 environment steps. The evidence therefore supports limited
-late-state coverage during training, not a general inability to act beyond 256 steps.
+The 256-step cap applied only to training rollouts. Each training episode stopped after
+256 environment steps. This limited training coverage of late-game states. Evaluation
+did not apply this training-specific cap. One successful Iter16 evaluation continued for
+666 environment steps before it cleared the maze. The cap therefore limited training
+coverage, not evaluation-time execution.
 
-The base-model failure is shown in Section 3.1. The following seed-matched checkpoint
-replays make the Iter16-versus-Iter49 selection gap directly visible.
+Section 3.1 shows the base-model failure. The matched replays below show why we selected
+Iter16 instead of Iter49.
 
 <table>
   <tr>
@@ -563,30 +549,35 @@ stuck, showing that near-complete pellet clearance does not guarantee terminal s
 
 #### Stage I-B: 512-step continuation and learning dynamics
 
-This phase continued from the selected Iter16 checkpoint, raised the rollout cap to 512
-steps, and used **raw per-decision feedback, with neither reward nor advantage
+Stage I-B started from the selected Iter16 checkpoint. It raised the rollout cap to 512
+steps. It used **raw feedback for each decision, with no reward or advantage
 normalization**. It produced Iter25 and Iter31.
+
+Each point in Figure 4 summarizes 48 stochastic training rollout episodes from one
+optimizer update. The points are not greedy evaluation results. The top panel's “Mean
+shaped reward” is the mean logged episode return for that batch. It is not reward per
+step. Normal-pellet clear rate is the mean fraction of starting pellets collected by the
+end of an episode. Win rate is the fraction of episodes that clear the maze. A shorter
+episode can mean an earlier win or an earlier failure, so read episode length together
+with the cap, win rate, and terminal reason.
 
 ![Stage I learning dynamics across the selected 256-step and 512-step lineage](../assets/figures/maapacman_stage1_learning_dynamics.png)
 
-*Figure 4. The selected lineage follows Stage I-A through Iter16 and then its Stage I-B
-continuation; Stage I-A continued separately to Iter49, which is not fully plotted. Each
-point aggregates 48 rollout episodes. Because rollout caps and reward scaling differ,
-shaped-reward levels should be compared within rather than across phases. Clear rate
-remains comparable across caps; shorter mean episode length matters only after wins
-appear.*
+*Figure 4. Training rollout dynamics for the selected lineage. Blue shows Stage I-A
+through Iter16 with a 256-step cap. Green shows Stage I-B, which started from Iter16 and
+used a 512-step cap. The separate Stage I-A run to Iter49 is not shown. Clear and win
+rates can be compared across phases. Shaped returns cannot be compared because the
+reward and normalization contracts change at the branch.*
 
 #### Held-out-maze generalization
 
-We evaluated Iter25, Iter31, and the base model on a shared set of 50 held-out maze
-layouts with deterministic greedy decoding and a 2,000-step limit. Iter16 itself was not
-run on this suite, so this is a separate generalization study rather than a single
-checkpoint curve spanning both Stage I phases.
+We evaluated Iter25, Iter31, and the base model on the same 50 held-out maze layouts. We
+used deterministic greedy decoding and a 2,000-step limit.
 
 ![Generalization across 50 held-out mazes](../assets/figures/maapacman_real50_generalization.png)
 
-*Figure 5. Iter25 produced a large paired improvement over the base model. Continuing to
-Iter31 did not improve the strict pass count.*
+*Figure 5. Iter25 increased strict passes from 0/50 to 44/50. Iter31 also passed 44/50
+mazes.*
 
 | Model           | Strict passes |   Wilson 95% CI | Mean normal pellets remaining |  Easy / medium / hard |
 | --------------- | ------------: | --------------: | ----------------------------: | --------------------: |
@@ -594,17 +585,15 @@ Iter31 did not improve the strict pass count.*
 | Iter25          |     **44/50** | **76.2%–94.4%** |                          0.30 | 17/17 · 17/17 · 10/16 |
 | Iter31          |     **44/50** | **76.2%–94.4%** |                      **0.24** | 17/17 · 17/17 · 10/16 |
 
-Base→Iter25 is a paired gain of 88 percentage points (exact two-sided McNemar
-`p=1.14e-13`). Iter25 and Iter31 have no discordant outcomes (McNemar `p=1.0`); both
-fail the same six hardest maze variants.
+Iter25 achieved an 88% pass rate (44/50), up from 0/50 for the base model. Iter31 also
+passed 44/50 mazes. Both checkpoints failed the same six hardest maze variants.
 
-The scope matters: this was a **geometry/navigation evaluation in safe mode, with ghosts
-and fruit disabled**. It is strong evidence that the learned policy transfers across
-maze layouts. It is not evidence of general ghost-aware Pacman play.
+This was a safe-mode test of navigation across maze layouts. Ghosts and fruit were
+disabled. The 44/50 result shows transfer across maze geometry in this setting. It does
+not test general ghost-aware Pacman play.
 
-Three replay-audited examples make the Iter31 navigation behavior directly inspectable.
-They use the same frozen checkpoint, seed 0, greedy decoding, open-action masking, and a
-2,000-step limit.
+The three videos below use the frozen Iter31 checkpoint on three maze layouts. All three
+use seed 0, greedy decoding, open-action masking, and a 2,000-step limit.
 
 <table>
   <tr>
@@ -635,41 +624,39 @@ They use the same frozen checkpoint, seed 0, greedy decoding, open-action maskin
   </tr>
 </table>
 
-*All three replays clear every normal pellet. As in the quantitative study, ghosts and
-fruit are disabled, so these videos demonstrate geometry and pellet-collection behavior
-rather than ghost-aware play.*
+*All three runs clear every normal pellet. Ghosts and fruit are disabled, so the videos
+show maze navigation and pellet collection, not ghost-aware play.*
 
 ### 5.2 Stage II: Ghost-enabled, harness-mediated option policy
 
-Stage II changes both the environment and the decision interface. Ghosts are enabled,
-and instead of choosing every primitive direction, the model selects among
-harness-generated high-level options for collecting pellets, avoiding danger, or
-pursuing an edible ghost.
+Stage II enables ghosts and changes the decision interface. The model no longer chooses
+every primitive direction. It chooses high-level options to collect pellets, avoid
+danger, or pursue an edible ghost.
 
-#### Rollout-only transfer probe
+#### Transfer before further training
 
-We first loaded Iter25 into this policy without performing another PPO update. In one
-matched probe at seed 2 and temperature 0.7, each model ran 12 episodes with a 512-step
-cap. Iter25 completed the normal-pellet objective in `8/12` episodes, compared with
-`2/12` for the original Qwen3.5-9B model. Both produced `12/12` unique option paths in
-this sample.
+We first tested Iter25 with this policy before any new PPO update. At seed 2 and
+temperature 0.7, Iter25 and the base model each ran 12 episodes with a 512-step cap.
+Iter25 completed the normal-pellet objective in `8/12` episodes, compared with `2/12`
+for the base Qwen3.5-9B model. Each model produced 12 distinct option paths across its
+12 episodes.
 
-#### Bounded training-path validation
+#### Three-update training check
 
-We then initialized both the actor and frozen KL reference from the immutable Iter25
-checkpoint and created a fresh optimizer for a bounded three-update validation run. Each
-update used four initial prompts and 12 rollout episodes per prompt, each capped at 512
-steps, for 48 episodes per update. Full collected rollout-episode returns were
-normalized only within each prompt group, the resulting episode signal was assigned to
-that episode's option decisions, and each episode received equal intended loss weight.
-All three optimizer updates completed and wrote regular model checkpoints.
+To test the full Stage II training loop, we initialized the actor and frozen KL
+reference from the same fixed Iter25 checkpoint and started a fresh optimizer. We ran
+three updates. Each update used four initial prompts and 12 episodes per prompt, for 48
+episodes with a 512-step cap. For each episode, we summed the collected rewards and
+normalized the return only within its prompt group. We assigned that signal to the
+episode's option decisions and gave every episode equal intended loss weight. All three
+updates finished and produced model checkpoints.
 
-#### Exploratory matched post-run diagnostic
+#### Exploratory comparison after training
 
-We subsequently began a separate in-sample evaluation on the original Stage II training
-prompts. The planned evaluation was stopped before all four policy versions reached 144
-episodes, so we froze the available file lists and retained only the exact 60 episode
-IDs present for the pre-update control and all three updated checkpoints.
+After training, we started an in-sample evaluation on the original Stage II prompts. The
+run stopped before all four policy versions reached the planned 144 episodes. We
+therefore compared only the 60 episode IDs available for the control and all three
+updated checkpoints. This kept the comparison paired.
 
 | Policy version     | Normal-pellet completions | Change vs. control | Mean normal pellets remaining | Mean score | Steps per model turn | Exact McNemar `p` vs. control |
 | ------------------ | ------------------------: | -----------------: | ----------------------------: | ---------: | -------------------: | ----------------------------: |
@@ -678,16 +665,15 @@ IDs present for the pre-update control and all three updated checkpoints.
 | Update 2           |             26/60 (43.3%) |            +8.3 pp |                          46.4 |     11,169 |                 1.50 |                         0.359 |
 | Update 3           |             23/60 (38.3%) |            +3.3 pp |                          49.1 |     11,114 |                 1.50 |                         0.839 |
 
-Update 2 had the highest observed completion rate, but its paired difference from the
-control was not statistically significant. The results are an exploratory snapshot on
-training prompts, not a completed evaluation or a held-out generalization claim.
+Update 2 had the highest observed completion rate. Its paired difference from the
+control was not statistically significant. The run was incomplete and reused training
+prompts. We therefore treat this result as exploratory, not as held-out evidence.
 
-#### Matched qualitative replay
+#### One matched replay
 
-The following replay-audited videos use the same training-prompt specification and
-sampling slot (seed 12, sample 00). The pre-update Iter25 control terminated with a
-safety refusal after 54 environment steps, with 152 normal pellets remaining. The Update
-2 checkpoint cleared all normal pellets in 352 steps.
+The two videos below use the same training prompt and sampling slot: seed 12, sample 00.
+The Iter25 control stopped with a safety refusal after 54 environment steps, with 152
+normal pellets left. Update 2 cleared all normal pellets in 352 steps.
 
 <table>
   <tr>
@@ -712,110 +698,101 @@ safety refusal after 54 environment steps, with 152 normal pellets remaining. Th
   </tr>
 </table>
 
-These videos visualize one matched in-sample example. They do not by themselves estimate
-win-rate improvement, demonstrate held-out transfer, or establish reliable ghost
-avoidance.
+This pair shows one behavior change on a training prompt. It does not estimate the
+overall win-rate change or test held-out transfer or reliable ghost avoidance.
 
-#### What this evidence establishes
+#### What Stage II shows
 
-The rollout probe shows that the Stage I checkpoint can operate with the ghost-enabled,
-harness-mediated option policy without collapsing to one repeated option sequence. The
-bounded three-update validation run shows that the whole-episode constrained-policy
-training path executes end to end. Update 2 had a higher observed completion rate in the
-exploratory paired snapshot, but its paired difference from the control was not
-statistically significant. The matched videos make one behavioral contrast inspectable.
-This is still not a long Stage II learning curve, a multi-seed improvement estimate, or
-evidence of general ghost avoidance. In particular, normal-pellet completion should not
-be silently equated with every possible full-game objective.
+Before further training, Iter25 used the ghost-enabled option policy and produced 12/12
+distinct option paths. The three-update run showed that the whole-episode
+constrained-policy training loop works end to end. In the incomplete paired comparison,
+Update 2 had the highest observed completion rate, but its difference from the control
+was not statistically significant. The matched videos show one concrete behavior change.
+
+Together, these results confirm the training path and give an early transfer signal, but
+they do not show a robust ghost-aware agent. That claim needs a longer learning curve,
+multiple seeds, and held-out evaluation. Clearing normal pellets is also only one
+possible full-game objective.
 
 ## 6. Insights
 
-### 6.1 More updates do not guarantee a better checkpoint
+### 6.1 Latest is not always best
 
-Iter16 beat Iter49 on the terminal evaluation even though Iter49 still had a high shaped
-reward and 92.2% mean pellet clearance. Long agent runs therefore need immutable
-periodic checkpoints and a fixed selection suite. “Latest” and “best” are different
-concepts. The result is consistent with later updates preserving a local shaped proxy
-without preserving terminal reliability. Limited late-episode credit and state coverage
-are plausible contributors, but this experiment does not isolate either mechanism or
-establish convergence to a local optimum.
+Iter16 beat Iter49 in terminal evaluation. Iter49 still had a high shaped reward and
+92.2% mean pellet clearance. Keep periodic checkpoints and use a fixed
+terminal-evaluation suite to choose the best one. The latest checkpoint is not always
+the best.
 
-### 6.2 Reward processing defines the objective, not just its scale
+We do not know why Iter49 regressed. Limited late-game coverage and weak late-episode
+credit are possible explanations. This run does not show that training converged to a
+local optimum.
 
-How rewards are aggregated, normalized, and reduced determines the learning objective. A
-normalized local reward remains local feedback; an episode return preserves the
-whole-game objective but provides coarser temporal credit. Episode averaging separately
-prevents longer trajectories from receiving more intended weight merely because they
-contain more trained tokens.
+### 6.2 Reward processing changes what the policy learns
 
-The reported runs do not isolate these choices. Stage I-A and Stage I-B differ in
-initialization, rollout horizon, and other settings, while Stage II also changes the
-environment and action interface. The results therefore do not establish that raw or
-normalized feedback—or local or episode-level feedback—is categorically better. That
-comparison requires a matched ablation.
+How we process rewards defines what the policy learns. Normalizing a local reward does
+not turn it into episode-level feedback. An episode return aligns learning with the
+whole-game outcome, but gives coarser temporal credit. Averaging by episode also stops
+longer trajectories from getting extra weight simply because they contain more trained
+tokens.
 
-### 6.3 Terminal outcomes expose proxy-metric failures
+These runs do not compare those choices in isolation. Stage I-A and Stage I-B also
+differ in initialization and rollout horizon. Stage II changes the environment and
+action interface as well. A fair comparison needs a matched ablation.
 
-Pellet-clear percentage, shaped reward, game score, and action diversity are useful
-diagnostics, but none is the task itself. Iter49 is the clearest example: 92.2% average
-clearance and 0/3 terminal wins. Terminal success and exact failure reasons must lead
-the evaluation table.
+### 6.3 Proxy metrics are not the task
 
-### 6.4 Generalization claims must match the environment contract
+Pellet clearance, shaped reward, score, and action diversity help explain behavior. They
+do not define success. Iter49 averaged 92.2% pellet clearance but won 0/3 games. Start
+the evaluation with terminal wins and failure reasons.
 
-The 44/50 result demonstrates transfer across maze geometry under safe-mode navigation.
-Enabling ghosts changes the transition distribution, reward events, and failure modes;
-under the harness-mediated option policy, it also changes the advertised options.
-“Generalizes across mazes” and “general Pacman agent” are not interchangeable claims.
+### 6.4 Safe-mode transfer is not general Pacman play
 
-### 6.5 Traceability is part of reliable training
+The 44/50 result shows transfer across maze layouts in safe mode. It does not show
+general Pacman play. Turning on ghosts changes the dynamics, rewards, and failure modes.
+With the option policy, it also changes which options are available.
 
-Long-horizon failures can arise from misaligned state-action metadata or incomplete
-rollouts even when the visible symptom appears elsewhere. Reproducible experiment
-records and explicit checkpoint-completion status are therefore necessary to interpret a
-curve.
+### 6.5 A learning curve is not enough
 
-## 7. Limitations and Future Work
+Misaligned state-action metadata or an incomplete rollout can look like a policy
+failure. Keep trajectory records and mark which checkpoints actually finished. Without
+them, the curve is hard to interpret.
 
-The current evidence supports a useful but bounded conclusion. These are limits of the
-present implementation or evidence, rather than part of the task definition:
+## 7. Limitations and Next Steps
 
-1. **Observation interface:** the harness-mediated option policy receives both the
-   screenshot and authoritative metadata for the currently advertised options. It
-   therefore evaluates multimodal high-level option selection rather than pixels-only
-   control. Future work should test temporal visual input such as two-frame or
-   map-plus-local observations.
-1. **Ghost-aware generalization:** separate prototype runs show that the
-   harness-mediated option policy can complete ghost-enabled games, but the reported
-   50-maze suite disables ghosts and fruit to isolate geometry. Repeat that suite with
-   controlled ghost dynamics and report deaths, edible-ghost decisions, and safety
-   refusals.
-1. **Handcrafted option harness:** the predefined strategy families, target-selection
-   rules, route construction, and safety gates are currently handcrafted. A longer-term
-   direction is to co-evolve the policy and option-generation mechanism while retaining
-   deterministic legality and safety validation.
-1. **Evaluation coverage and hard-maze diagnosis:** repeat training with multiple random
-   seeds, evaluate Iter16, Iter25, and Iter31 on the same 50-maze suite, and investigate
-   the six hardest mazes failed by both Iter25 and Iter31 before extending training.
-1. **Controlled reward and credit study:** under matched initialization and budget,
-   compare raw per-decision feedback, whole-episode normalization, raw option-span
+Several gaps remain in the current implementation and evidence:
+
+1. **The policy does not use pixels alone.** The option policy receives a screenshot
+   plus authoritative metadata for the available options. This tests multimodal option
+   selection, not pixels-only control. Next, test two-frame or map-plus-local visual
+   input.
+1. **The 50-maze result is not ghost-aware.** In separate prototype runs, the
+   harness-mediated option policy completed ghost-enabled games. The reported 50-maze
+   suite disabled ghosts and fruit to isolate geometry. A ghost-aware suite should track
+   deaths, edible-ghost choices, and safety refusals.
+1. **The option harness is handcrafted.** Strategy families, target selection, routing,
+   and safety gates are rules rather than learned behavior. A longer-term goal is to
+   learn the policy and option generator together while keeping legality and safety
+   checks deterministic.
+1. **Coverage is still narrow.** Repeat training across multiple random seeds. Evaluate
+   Iter16, Iter25, and Iter31 on the same 50 mazes. Inspect the six mazes failed by both
+   Iter25 and Iter31 before training longer.
+1. **Reward comparisons need a matched ablation.** Hold initialization and budget fixed.
+   Then compare raw per-decision feedback, whole-episode normalization, raw option-span
    feedback, and an episode objective with a small bounded local auxiliary. The
-   auxiliary remains an untrained proposal; begin with a fixed coefficient before
-   considering adaptive gradient balancing.
+   auxiliary is still only a proposal. Start with a fixed coefficient before trying
+   adaptive gradient balancing.
 
 ## 8. Conclusion
 
-Pacman gave us a compact way to expose the real difficulties of visual-agent RL:
-state-dependent admissible-action sets, long episodes, delayed credit, distributed
-constraint alignment, and expensive feedback. The deterministic MaaPacman environment
-made scalable, reproducible training possible, while AReaL supplied the asynchronous
-rollout and distributed RL foundation.
+Pacman is small, but it exercises the hard parts of visual-agent RL: state-dependent
+actions, long episodes, delayed credit, rollout-training alignment, and distributed
+execution. MaaPacman provides a deterministic, resettable environment. AReaL provides
+asynchronous rollouts and distributed training.
 
-The main empirical result is that the trained policy transferred from the base maze
-distribution to 44 of 50 held-out layouts under the stated safe-mode contract, compared
-with 0 of 50 for the base model. The equally important systems result is that the latest
-checkpoint was not the best one, and that reward-normalization choices change the
-learning objective rather than merely the scale of a metric.
+In safe mode, the trained policy solved 44 of 50 held-out mazes. The base model solved
+none. The experiments also showed that the latest checkpoint can be worse than an
+earlier one. Reward normalization changes the learning objective, not just the metric
+scale.
 
-That combination—measurable improvement plus explicit boundaries on what the experiment
-proves—is the standard we want for the next, harder game-agent experiments.
+Next, we will test controlled ghost dynamics and run matched ablations. We will keep a
+clear boundary between what the results show and what they do not.
