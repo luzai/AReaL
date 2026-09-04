@@ -296,7 +296,11 @@ def _audit_pacman_logprob_alignment(
     require_actor_reference_alignment: bool = True,
     expected_option_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """Verify rollout, proximal actor, and reference option probabilities.
+    """Verify rollout and proximal actor option probabilities.
+
+    Reference probabilities are also verified when present. Reference-free
+    training must explicitly disable actor/reference alignment; the rollout to
+    proximal-actor checks remain mandatory in that mode.
 
     ``exact`` requires the inference and training backends to reproduce token
     log-probabilities numerically. ``behavior`` still reports that exact check,
@@ -323,11 +327,26 @@ def _audit_pacman_logprob_alignment(
             "Pacman behavior filtered-fraction tolerance must be in [0, 1]"
         )
 
-    comparisons = {
-        "rollout_actor": [],
-        "rollout_reference": [],
-        "actor_reference": [],
-    }
+    reference_presence = ["ref_logp" in trajectory for trajectory in batch]
+    if any(reference_presence) and not all(reference_presence):
+        raise RuntimeError(
+            "Pacman log-prob audit found inconsistent reference log-probs"
+        )
+    reference_available = bool(batch) and all(reference_presence)
+    if require_actor_reference_alignment and not reference_available:
+        raise RuntimeError(
+            "Pacman log-prob audit requires reference log-probs when "
+            "actor-reference alignment is enabled"
+        )
+
+    comparisons = {"rollout_actor": []}
+    if reference_available:
+        comparisons.update(
+            {
+                "rollout_reference": [],
+                "actor_reference": [],
+            }
+        )
     records: list[dict[str, Any]] = []
     support_sizes: set[int] = set()
     for trajectory_index, trajectory in enumerate(batch):
@@ -336,10 +355,11 @@ def _audit_pacman_logprob_alignment(
             "loss_mask",
             "logprobs",
             "prox_logp",
-            "ref_logp",
             "versions",
             "pacman_allowed_token_ids",
         }
+        if reference_available:
+            required.add("ref_logp")
         missing = required - trajectory.keys()
         if missing:
             raise RuntimeError(
@@ -351,21 +371,25 @@ def _audit_pacman_logprob_alignment(
         rollout = torch.roll(local["logprobs"].detach().cpu().float(), -1, dims=-1)
         versions = torch.roll(local["versions"].detach().cpu(), -1, dims=-1)
         actor = local["prox_logp"].detach().cpu().float()
-        reference = local["ref_logp"].detach().cpu().float()
+        reference = (
+            local["ref_logp"].detach().cpu().float() if reference_available else None
+        )
         sampled_ids = torch.roll(input_ids, -1, dims=-1)
         supports = torch.roll(
             local["pacman_allowed_token_ids"].detach().cpu(),
             -1,
             dims=-2,
         )
-        if not (
-            rollout.shape
-            == actor.shape
-            == reference.shape
-            == loss_mask.shape
-            == sampled_ids.shape
-            == versions.shape
-            == supports.shape[:-1]
+        expected_shape = rollout.shape
+        shapes = (
+            actor.shape,
+            loss_mask.shape,
+            sampled_ids.shape,
+            versions.shape,
+            supports.shape[:-1],
+        )
+        if any(shape != expected_shape for shape in shapes) or (
+            reference is not None and reference.shape != expected_shape
         ):
             raise RuntimeError("Pacman log-prob audit tensor shapes disagree")
         support_active = supports.ne(0).any(dim=-1)
@@ -386,15 +410,19 @@ def _audit_pacman_logprob_alignment(
             values = {
                 "rollout": float(rollout[batch_index, token_index]),
                 "actor": float(actor[batch_index, token_index]),
-                "reference": float(reference[batch_index, token_index]),
             }
+            if reference is not None:
+                values["reference"] = float(reference[batch_index, token_index])
             if not bool(torch.isfinite(torch.tensor(list(values.values()))).all()):
                 raise RuntimeError("Pacman log-prob audit found NaN or Inf")
             comparisons["rollout_actor"].append(values["actor"] - values["rollout"])
-            comparisons["rollout_reference"].append(
-                values["reference"] - values["rollout"]
-            )
-            comparisons["actor_reference"].append(values["actor"] - values["reference"])
+            if reference is not None:
+                comparisons["rollout_reference"].append(
+                    values["reference"] - values["rollout"]
+                )
+                comparisons["actor_reference"].append(
+                    values["actor"] - values["reference"]
+                )
             support_sizes.add(len(support))
             records.append(
                 {
@@ -468,19 +496,26 @@ def _audit_pacman_logprob_alignment(
     singleton_abs_deltas = [
         abs(record["actor"] - record["rollout"]) for record in singleton_records
     ]
+    probability_roles = (
+        ("rollout", "actor", "reference")
+        if reference_available
+        else ("rollout", "actor")
+    )
     singleton_abs_logps = [
-        abs(record[role])
-        for record in singleton_records
-        for role in ("rollout", "actor", "reference")
+        abs(record[role]) for record in singleton_records for role in probability_roles
     ]
-    transitivity_residuals = [
-        abs(
-            (record["actor"] - record["rollout"])
-            - (record["reference"] - record["rollout"])
-            - (record["actor"] - record["reference"])
-        )
-        for record in records
-    ]
+    transitivity_residuals = (
+        [
+            abs(
+                (record["actor"] - record["rollout"])
+                - (record["reference"] - record["rollout"])
+                - (record["actor"] - record["reference"])
+            )
+            for record in records
+        ]
+        if reference_available
+        else []
+    )
     option_records = []
     for record in sorted(
         records,
@@ -505,20 +540,21 @@ def _audit_pacman_logprob_alignment(
                     "support_sizes": [],
                     "joint_rollout_logp": 0.0,
                     "joint_actor_logp": 0.0,
-                    "joint_reference_logp": 0.0,
                 }
             )
+            if reference_available:
+                option_records[-1]["joint_reference_logp"] = 0.0
         option = option_records[-1]
         option["end_token_index"] = record["token_index"]
         option["support_sizes"].append(record["support_size"])
-        for role in ("rollout", "actor", "reference"):
+        for role in probability_roles:
             option[f"joint_{role}_logp"] += record[role]
     for option in option_records:
         option["token_count"] = len(option["support_sizes"])
         log_ratio = option["joint_actor_logp"] - option["joint_rollout_logp"]
         option["actor_rollout_log_ratio"] = log_ratio
         option["behavior_importance_ratio"] = math.exp(log_ratio)
-        for role in ("rollout", "actor", "reference"):
+        for role in probability_roles:
             option[f"joint_{role}_probability"] = math.exp(option[f"joint_{role}_logp"])
     sample_keys = {
         (record["trajectory_index"], record["sample_index"]) for record in records
@@ -569,6 +605,8 @@ def _audit_pacman_logprob_alignment(
         metrics["actor_reference"]["max_abs_delta"] <= actor_reference_max_abs_tolerance
         and metrics["actor_reference"]["mean_abs_delta"]
         <= actor_reference_mean_abs_tolerance
+        if reference_available
+        else None
     )
     behavior_metrics = {
         "branching_tokens": len(branching_records),
@@ -614,7 +652,9 @@ def _audit_pacman_logprob_alignment(
         "singleton_max_abs_logp": (
             max(singleton_abs_logps) if singleton_abs_logps else 0.0
         ),
-        "transitivity_max_abs_residual": max(transitivity_residuals),
+        "transitivity_max_abs_residual": (
+            max(transitivity_residuals) if transitivity_residuals else None
+        ),
         "option_count": len(option_records),
         "option_min_importance_ratio": min(option_behavior_ratios),
         "option_max_importance_ratio": max(option_behavior_ratios),
@@ -629,11 +669,14 @@ def _audit_pacman_logprob_alignment(
         "singleton_max_abs_tolerance": singleton_max_abs_tolerance,
     }
     behavior_compatible = (
-        (actor_reference_aligned or not require_actor_reference_alignment)
+        (not require_actor_reference_alignment or bool(actor_reference_aligned))
         and bool(kept_option_ratios)
         and would_filter_option_fraction <= behavior_max_filtered_fraction
         and behavior_metrics["singleton_max_abs_logp"] <= singleton_max_abs_tolerance
-        and behavior_metrics["transitivity_max_abs_residual"] <= 1.0e-7
+        and (
+            behavior_metrics["transitivity_max_abs_residual"] is None
+            or behavior_metrics["transitivity_max_abs_residual"] <= 1.0e-7
+        )
     )
     accepted = exact_aligned if acceptance_mode == "exact" else behavior_compatible
     version_values = sorted({record["version"] for record in records})
@@ -644,7 +687,9 @@ def _audit_pacman_logprob_alignment(
     report = {
         "accepted": accepted,
         "acceptance_mode": acceptance_mode,
+        "reference_available": reference_available,
         "require_actor_reference_alignment": require_actor_reference_alignment,
+        "actor_reference_aligned": actor_reference_aligned,
         "aligned": exact_aligned,
         "behavior_compatible": behavior_compatible,
         "global_step": global_step,
@@ -679,10 +724,12 @@ def _audit_pacman_logprob_alignment(
         )
     logger.info(
         "MAAPACMAN_LOGPROB_ALIGNMENT_OK mode=%s exact=%s "
-        "behavior_compatible=%s global_step=%s tokens=%s report=%s",
+        "behavior_compatible=%s reference_available=%s global_step=%s "
+        "tokens=%s report=%s",
         acceptance_mode,
         exact_aligned,
         behavior_compatible,
+        reference_available,
         global_step,
         len(records),
         output_path,
@@ -1369,9 +1416,9 @@ class PPOTrainer:
                 "0",
             )
             if alignment_dir and global_step in alignment_steps:
-                if self.ref is None or not config.actor.should_compute_prox_logp():
+                if not config.actor.should_compute_prox_logp():
                     raise RuntimeError(
-                        "Pacman log-prob audit requires reference and proximal actor log-probs"
+                        "Pacman log-prob audit requires proximal actor log-probs"
                     )
                 acceptance_mode = os.getenv(
                     "MAAPACMAN_LOGPROB_ACCEPTANCE_MODE", "exact"
