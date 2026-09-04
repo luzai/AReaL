@@ -483,7 +483,7 @@ class TrainEngine(abc.ABC):
         return self.forward_batch(input_, output_seqlens, aggregate_fn)
 
     @abc.abstractmethod
-    def export_stats(self) -> dict[str, float]:
+    def export_stats(self, reset: bool = True) -> dict[str, float]:
         """Export the statistics recorded in this engine process.
 
         Note

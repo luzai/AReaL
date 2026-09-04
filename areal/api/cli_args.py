@@ -2482,6 +2482,30 @@ class EvaluatorConfig(_Timer):
 class SaverConfig(_Timer):
     """Configuration for model checkpoint saving scheduling and timing."""
 
+    keep_last: int | None = field(
+        default=None,
+        metadata={
+            "help": "Keep only the newest N regular model checkpoints. "
+            "None disables checkpoint pruning. Recovery checkpoints are not pruned."
+        },
+    )
+
+    keep_best_metric: str | None = field(
+        default=None,
+        metadata={
+            "help": "Additionally preserve the checkpoint with the best value "
+            "of this exported training metric. None disables best-checkpoint saves."
+        },
+    )
+
+    keep_best_mode: str = field(
+        default="max",
+        metadata={
+            "help": "Whether a larger ('max') or smaller ('min') metric is better.",
+            "choices": ["max", "min"],
+        },
+    )
+
     mode: str = field(
         default="auto",
         metadata={
@@ -2498,6 +2522,12 @@ class SaverConfig(_Timer):
     )
 
     def __post_init__(self):
+        if self.keep_last is not None and self.keep_last < 1:
+            raise ValueError("keep_last must be at least 1 or None")
+        if self.keep_best_metric is not None and not self.keep_best_metric.strip():
+            raise ValueError("keep_best_metric must be non-empty or None")
+        if self.keep_best_mode not in {"max", "min"}:
+            raise ValueError("keep_best_mode must be 'max' or 'min'")
         valid_modes = {"auto", "sync", "async"}
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid mode '{self.mode}'. Valid: {valid_modes}")

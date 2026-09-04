@@ -902,10 +902,11 @@ class FSDPEngine(TrainEngine):
             return result
         return split_batch(result, meta)
 
-    def export_stats(self) -> dict[str, float]:
+    def export_stats(self, reset: bool = True) -> dict[str, float]:
         with self._offload_aware_context():
             return stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
+                reset=reset,
             )
 
     def offload(self) -> None:
