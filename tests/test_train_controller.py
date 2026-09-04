@@ -350,6 +350,47 @@ class TestTrainControllerRPCWrappers:
         engine_calls = [call[1] for call in train_controller.scheduler.engine_calls]
         assert "step_lr_scheduler" in engine_calls
 
+    @pytest.mark.parametrize("method", ["offload", "onload"])
+    def test_memory_transition_skips_gpu_payload_broadcast(
+        self, train_controller, ft_spec, method
+    ):
+        """TMS must resume before any new CUDA-backed RPC broadcast."""
+        train_controller.initialize(
+            role="train_worker",
+            ft_spec=ft_spec,
+        )
+        train_controller.scheduler.engine_calls = []
+
+        getattr(train_controller, method)()
+
+        calls = [
+            call
+            for call in train_controller.scheduler.engine_calls
+            if call[1] == method
+        ]
+        assert calls
+        assert all(call[3]["rpc_meta"] == {"broadcast": False} for call in calls)
+
+    def test_save_perf_tracer_skips_gpu_payload_broadcast(
+        self, train_controller, ft_spec
+    ):
+        """Trace persistence must work while a TMS engine is offloaded."""
+        train_controller.initialize(
+            role="train_worker",
+            ft_spec=ft_spec,
+        )
+        train_controller.scheduler.engine_calls = []
+
+        train_controller.save_perf_tracer(step=7, force=True)
+
+        calls = [
+            call
+            for call in train_controller.scheduler.engine_calls
+            if call[1] == "save_perf_tracer"
+        ]
+        assert calls
+        assert all(call[3]["rpc_meta"] == {"broadcast": False} for call in calls)
+
 
 class TestTrainControllerWeightManagement:
     """Tests for weight management operations."""
@@ -660,11 +701,13 @@ class TestTrainControllerExportStats:
 
         # Mock the scheduler to return stats
         expected_stats = {"loss": 0.5, "accuracy": 0.95}
+        export_stats_rpc_meta = []
 
         async def mock_async_call(*args, **kwargs):
             if kwargs.get("method") == "export_stats" or (
                 len(args) > 1 and args[1] == "export_stats"
             ):
+                export_stats_rpc_meta.append(kwargs.get("rpc_meta"))
                 return expected_stats
             return None
 
@@ -673,6 +716,10 @@ class TestTrainControllerExportStats:
         result = train_controller.export_stats()
         for k in expected_stats:
             assert result[k] == expected_stats[k]
+        assert export_stats_rpc_meta
+        assert all(
+            rpc_meta == {"broadcast": False} for rpc_meta in export_stats_rpc_meta
+        )
 
 
 class TestTrainControllerDispatchInputs:

@@ -624,7 +624,13 @@ class TrainController:
         # Statistics have been aggregated and synchronized across workers
         # All results should be identical, so return the first one
         stats = stats_tracker.export_all()
-        stats.update(self._custom_function_call("export_stats"))
+        # export_stats is an argument-free call executed independently on every
+        # worker.  Broadcasting its empty argument container is unnecessary and
+        # can touch CUDA after TMS has offloaded the engine, where c10d's object
+        # broadcast may fail while materializing its metadata ByteTensor.
+        stats.update(
+            self._custom_function_call("export_stats", rpc_meta={"broadcast": False})
+        )
         return stats
 
     # ==================== ENGINE RPC WRAPPERS ====================
@@ -715,11 +721,14 @@ class TrainController:
 
     def offload(self) -> None:
         """Offload model parameters to CPU across all train workers."""
-        self._custom_function_call("offload")
+        # These calls have no payload.  More importantly, after TMS pauses CUDA
+        # allocations, broadcasting even an empty RPC payload on the GPU makes
+        # the subsequent onload call fail before the engine can resume memory.
+        self._custom_function_call("offload", rpc_meta={"broadcast": False})
 
     def onload(self) -> None:
         """Onload model parameters to GPU across all train workers."""
-        self._custom_function_call("onload")
+        self._custom_function_call("onload", rpc_meta={"broadcast": False})
 
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
@@ -748,7 +757,15 @@ class TrainController:
         run_async_task(_call)
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
-        self._custom_function_call("save_perf_tracer", step=step, force=force)
+        # The reference engine can still be TMS-offloaded when the trainer
+        # persists its trace.  The scalar arguments do not require a GPU-side
+        # tensor broadcast, which is invalid while CUDA allocations are paused.
+        self._custom_function_call(
+            "save_perf_tracer",
+            step=step,
+            force=force,
+            rpc_meta={"broadcast": False},
+        )
 
     def prepare_batch(
         self,
