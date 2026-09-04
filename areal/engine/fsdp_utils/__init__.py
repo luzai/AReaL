@@ -91,8 +91,23 @@ def apply_fsdp2(model, fsdp_kwargs, wrap_policy):
 
     modules = []
     for name, module in model.named_modules():
-        if module.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap or (
+        is_embedding = (
             isinstance(module, nn.Embedding) and not model.config.tie_word_embeddings
+        )
+        if is_embedding and name.rpartition(".")[2] == "pos_embed":
+            parent_name = name.rpartition(".")[0]
+            parent = model.get_submodule(parent_name) if parent_name else model
+            # Qwen3.5 reads pos_embed.weight.device before calling this embedding.
+            # A standalone FSDP boundary with CPU offload therefore exposes the
+            # offloaded CPU device, then materializes the weight on CUDA inside
+            # the embedding call and produces a CPU-index/CUDA-weight mismatch.
+            # Keep this tiny embedding under the vision/root FSDP boundary so it
+            # is materialized before Qwen3.5 samples the weight device.
+            if parent.__class__.__name__ == "Qwen3_5VisionModel":
+                continue
+        if (
+            module.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap
+            or is_embedding
         ):
             modules.append(module)
 
