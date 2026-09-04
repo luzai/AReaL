@@ -211,7 +211,9 @@ def _prepare_multimodal_forward_inputs(
         for key in _MULTIMODAL_FORWARD_KEYS:
             values = [item[key] for item in multi_modal_input if key in item]
             if values:
-                padded_mb[key] = torch.cat(values, dim=0)
+                padded_mb[key] = torch.cat(values, dim=0).to(
+                    padded_mb["input_ids"].device
+                )
 
     _drop_multimodal_payloads(mb)
 
@@ -480,6 +482,14 @@ class FSDPEngine(TrainEngine):
                 device_id=self.device,
                 prefetch_layers=self.config.fsdp.optim_step_prefetch_layers,
             )
+
+        # CPUOffloadPolicy has already moved the persistent FSDP parameter
+        # shards to CPU, but from_pretrained() can leave their former CUDA
+        # allocations in this process's caching allocator. Release that
+        # unused cache so a colocated engine can use the memory.
+        if self.cpu_offload is not None:
+            gc.collect()
+            current_platform.empty_cache()
 
         self._initialized = True
 
@@ -1831,14 +1841,14 @@ class FSDPEngine(TrainEngine):
                     if "image_grid_thw" in m
                 ]
                 if image_grid_thw_list:
-                    image_grid_thw = torch.cat(image_grid_thw_list)
+                    image_grid_thw = torch.cat(image_grid_thw_list).to(input_ids.device)
                 video_grid_thw_list = [
                     m["video_grid_thw"]
                     for m in multi_modal_input
                     if "video_grid_thw" in m
                 ]
                 if video_grid_thw_list:
-                    video_grid_thw = torch.cat(video_grid_thw_list)
+                    video_grid_thw = torch.cat(video_grid_thw_list).to(input_ids.device)
 
             position_ids = self.model.model.compute_3d_position_ids(
                 input_ids=input_ids,
@@ -1951,9 +1961,18 @@ class FSDPEngine(TrainEngine):
             )
         else:
             inputs = mb_item.padded_mb
+            # Recipe-owned policy metadata belongs to the loss context, not
+            # the Hugging Face model forward kwargs. orig_mb retains it.
+            inputs.pop("pacman_action_mask_bits", None)
             trie_node = inputs.pop("trie_node", None)
             ulysses_pad_size = 0
 
+        if self.parallel_helper.sp_size > 1 and (
+            "pacman_action_mask_bits" in mb_item.orig_mb
+        ):
+            raise NotImplementedError(
+                "Pacman dynamic action masks do not yet support sequence parallelism"
+            )
         ctx = FSDPTrainContext(
             model_inputs=inputs,
             mb_input=mb_item.orig_mb,
@@ -1982,11 +2001,96 @@ class FSDPEngine(TrainEngine):
                 vocab_max_logits = vocab_max_logits[:-ulysses_pad_size]
         return vocab_min_logits, vocab_max_logits
 
+    def _apply_pacman_action_mask(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        action_mask_bits: torch.Tensor | None,
+        logprobs: torch.Tensor,
+        entropy: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Normalize action-token probabilities over the rollout-time mask."""
+        if action_mask_bits is None:
+            return logprobs, entropy
+        if self.parallel_helper.tp_size > 1:
+            raise NotImplementedError(
+                "Pacman dynamic action masks do not yet support tensor parallelism"
+            )
+
+        token_ids = getattr(self, "_pacman_action_token_ids", None)
+        if token_ids is None:
+            encoded = [
+                self.tokenizer.encode(action, add_special_tokens=False)
+                for action in ("U", "D", "L", "R")
+            ]
+            if any(len(ids) != 1 for ids in encoded):
+                raise RuntimeError(
+                    "Pacman actions must each map to exactly one tokenizer token"
+                )
+            token_ids = torch.tensor(
+                [ids[0] for ids in encoded],
+                dtype=torch.long,
+                device=logits.device,
+            )
+            if token_ids.unique().numel() != 4:
+                raise RuntimeError("Pacman action tokenizer IDs must be distinct")
+            self._pacman_action_token_ids = token_ids
+        else:
+            token_ids = token_ids.to(logits.device)
+
+        bits = action_mask_bits.reshape(-1).to(device=logits.device, dtype=torch.uint8)
+        if bits.numel() > logits.shape[0]:
+            raise RuntimeError("Pacman action mask is longer than actor logits")
+        if bits.numel() < logits.shape[0]:
+            bits = torch.nn.functional.pad(
+                bits, (0, logits.shape[0] - bits.numel()), value=0
+            )
+        # The workflow stores the mask on the sampled token. Shift it to the
+        # causal logit position that predicts that token.
+        bits = torch.roll(bits, shifts=-1, dims=0)
+        allowed = (
+            bits.unsqueeze(-1)
+            & torch.tensor([1, 2, 4, 8], dtype=torch.uint8, device=logits.device)
+        ).bool()
+        active = allowed.any(dim=-1)
+        if not active.any():
+            return logprobs, entropy
+
+        scaled = logits.index_select(-1, token_ids).float()
+        scaled = scaled / self.config.temperature
+        masked_scaled = scaled.masked_fill(~allowed, float("-inf"))
+        denominator = torch.logsumexp(masked_scaled, dim=-1)
+        target_matches = labels.reshape(-1, 1).eq(token_ids.reshape(1, -1))
+        target_allowed = target_matches & allowed
+        if not target_allowed[active].any(dim=-1).all():
+            raise RuntimeError(
+                "sampled Pacman action token is absent from its rollout-time mask"
+            )
+        target_scaled = torch.where(
+            target_allowed, scaled, torch.zeros_like(scaled)
+        ).sum(dim=-1)
+        masked_logprobs = target_scaled - denominator
+        logprobs = torch.where(active, masked_logprobs, logprobs)
+
+        if entropy is not None:
+            normalized = masked_scaled - denominator.unsqueeze(-1)
+            probabilities = torch.where(
+                allowed, normalized.exp(), torch.zeros_like(normalized)
+            )
+            masked_entropy = -torch.where(
+                allowed,
+                probabilities * normalized,
+                torch.zeros_like(normalized),
+            ).sum(dim=-1)
+            entropy = torch.where(active, masked_entropy, entropy)
+        return logprobs, entropy
+
     def _compute_logprobs_entropy(
         self,
         logits: torch.Tensor,
         inputs: dict[str, Any],
         ulysses_pad_size: int = 0,
+        action_mask_bits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Try to get rolled_input_ids (if Ulysses SP is enabled)
         labels = inputs.get(
@@ -2004,6 +2108,13 @@ class FSDPEngine(TrainEngine):
             if self.parallel_helper.tp_size > 1
             else None,
         )
+        logprobs, entropy = self._apply_pacman_action_mask(
+            logits,
+            labels,
+            action_mask_bits,
+            logprobs,
+            entropy,
+        )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
             entropy = self._sp_all_gather(entropy)
@@ -2017,6 +2128,7 @@ class FSDPEngine(TrainEngine):
         logits: torch.Tensor,
         inputs: dict[str, Any],
         ulysses_pad_size: int = 0,
+        action_mask_bits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Try to get rolled_input_ids (if Ulysses SP is enabled)
         labels = inputs.get(
@@ -2033,6 +2145,12 @@ class FSDPEngine(TrainEngine):
             tp_group=self.parallel_helper.tp_group
             if self.parallel_helper.tp_size > 1
             else None,
+        )
+        logprobs, _ = self._apply_pacman_action_mask(
+            logits,
+            labels,
+            action_mask_bits,
+            logprobs,
         )
         if self.parallel_helper.sp_size > 1:
             logprobs = self._sp_all_gather(logprobs)
@@ -2096,7 +2214,10 @@ class FSDPEngine(TrainEngine):
                 )
             else:
                 logprobs, entropy = self._compute_logprobs_entropy(
-                    logits, ctx.model_inputs, ctx.ulysses_pad_size
+                    logits,
+                    ctx.model_inputs,
+                    ctx.ulysses_pad_size,
+                    ctx.mb_input.get("pacman_action_mask_bits"),
                 )
                 vocab_min_logits, vocab_max_logits = self._get_vocab_min_max_logits(
                     logits, ctx.ulysses_pad_size
@@ -2145,7 +2266,10 @@ class FSDPEngine(TrainEngine):
                 )
                 return result
             result = self._compute_logprobs(
-                logits, ctx.model_inputs, ctx.ulysses_pad_size
+                logits,
+                ctx.model_inputs,
+                ctx.ulysses_pad_size,
+                ctx.mb_input.get("pacman_action_mask_bits"),
             )
         else:
             result = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)
