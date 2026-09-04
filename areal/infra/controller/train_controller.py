@@ -431,6 +431,7 @@ class TrainController:
                             worker_id=worker.id,
                             method="destroy",
                             engine_name=self._engine_name(rank),
+                            rpc_meta={"broadcast": False},
                         )
                         for rank, worker in enumerate(self.workers)
                     ]

@@ -277,6 +277,25 @@ class TestTrainControllerDestroy:
             getattr(train_controller.scheduler, "delete_reverse_order", False) is True
         )
 
+    def test_destroy_skips_payload_broadcast(self, train_controller, ft_spec):
+        """Each rank destroys its own engine without a final CUDA collective."""
+        train_controller.initialize(role="train_worker", ft_spec=ft_spec)
+        expected_destroy_calls = len(train_controller.workers)
+        train_controller.scheduler.engine_calls.clear()
+
+        train_controller.destroy()
+
+        destroy_calls = [
+            call
+            for call in train_controller.scheduler.engine_calls
+            if call[1] == "destroy"
+        ]
+        assert len(destroy_calls) == expected_destroy_calls
+        assert all(
+            kwargs["rpc_meta"] == {"broadcast": False}
+            for _, _, _, kwargs in destroy_calls
+        )
+
 
 class TestTrainControllerMergeResults:
     """Tests for result merging via _merge_tensors."""

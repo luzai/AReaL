@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import functools
 import os
+import time
 from collections.abc import Callable
 from copy import deepcopy
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
 import torch.distributed as dist
@@ -73,6 +75,24 @@ if TYPE_CHECKING:
     from areal.trainer.ppo.critic import PPOCriticController
 
 logger = logging.getLogger("RLTrainer")
+
+
+def _parse_update_gate_global_steps(
+    value: str | None,
+    legacy_value: str | None = None,
+) -> set[int]:
+    """Parse one or more zero-based update steps used by managed-run gates."""
+
+    raw = value if value not in (None, "") else legacy_value
+    if raw in (None, ""):
+        return set()
+    try:
+        steps = {int(part.strip()) for part in raw.split(",") if part.strip()}
+    except ValueError as exc:
+        raise ValueError(f"invalid managed update gate steps: {raw!r}") from exc
+    if not steps or any(step < 0 for step in steps):
+        raise ValueError(f"invalid managed update gate steps: {raw!r}")
+    return steps
 
 
 class _EmptyDataLoader:
@@ -469,6 +489,34 @@ class PPOTrainer:
         ):
             engine.offload()
 
+    def _clear_consumed_rollout_batch(self, rollout_batch) -> None:
+        """Release rollout RTensors once the self-contained advantage batch exists."""
+
+        self.actor.clear_batches(rollout_batch)
+        if self.critic is not None:
+            self.critic.clear_batches(rollout_batch)
+        if self.ref is not None:
+            self.ref.clear_batches(rollout_batch)
+        logger.info("PPO_CPU_STAGING_AUDIT phase=clear_rollout_batch status=ok")
+
+    def _reset_actor_memory_before_ppo(self, did_recompute_logp: bool) -> None:
+        """Discard recompute allocator cache before the optimizer state is materialized.
+
+        With actor offload enabled, a recompute forward can leave tens of GiB in the
+        CUDA caching allocator even after its tensors are released.  PPO then creates
+        gradients and Adam state on top of that cache.  A TMS offload/onload cycle
+        preserves the live actor/optimizer allocations while rebuilding the CUDA
+        allocator from only the live set.
+        """
+
+        if not (self._should_offload_actor and did_recompute_logp):
+            return
+        logger.info("PPO_MEMORY_RESET_AUDIT phase=before_offload status=start")
+        self._offload_model(self.actor, role="actor_pre_ppo_reset")
+        self._onload_model(self.actor, role="actor_pre_ppo_reset")
+        self.actor.get_device_stats().log("actor memory reset before ppo")
+        logger.info("PPO_MEMORY_RESET_AUDIT phase=after_onload status=ok")
+
     def _offload_rollout(self, is_eval: bool = False):
         rollout = self.rollout if not is_eval else self.eval_rollout
         if rollout is None:
@@ -714,6 +762,21 @@ class PPOTrainer:
                 adv_batch = self.actor.compute_advantages(rollout_batch)
                 self.actor.get_device_stats().log("compute advantages")
 
+            # ``adv_batch`` contains every field needed by actor/critic PPO.
+            # Keeping the source rollout RTensors alive until step end doubles
+            # the large token-level payload on the training GPUs.  Drain those
+            # shards now; the final clear remains intentionally idempotent.
+            if is_single_controller():
+                self._clear_consumed_rollout_batch(rollout_batch)
+                self.actor.get_device_stats().log("clear rollout before ppo")
+
+            # The advantage payload is self-contained at this point.  Rebuild the
+            # actor allocator before PPO so cached recompute buffers do not compete
+            # with newly materialized gradient and optimizer state.
+            self._reset_actor_memory_before_ppo(
+                did_recompute_logp=config.actor.should_compute_prox_logp()
+            )
+
             # Wait for async checkpoint staging to complete before modifying parameters
             self.saver.maybe_wait_for_staging()
 
@@ -734,6 +797,18 @@ class PPOTrainer:
                 self.actor.ppo_update(adv_batch)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
+                audit_step = int(
+                    os.getenv("MAAPACMAN_FIRST_UPDATE_GATE_GLOBAL_STEP", "16")
+                )
+                if (
+                    os.getenv("MAAPACMAN_STRICT_RUNTIME_AUDIT") == "1"
+                    and global_step == audit_step
+                ):
+                    self.actor._custom_function_call(
+                        "runtime_state_audit",
+                        expected_phase="cuda",
+                        rpc_meta={"broadcast": False},
+                    )
 
             if (
                 config.memory_profiler is not None
@@ -873,6 +948,52 @@ class PPOTrainer:
             ):
                 self._export_and_commit_stats(
                     epoch=epoch, epoch_step=step, global_step=global_step
+                )
+
+            gate_dir = os.getenv("MAAPACMAN_UPDATE_GATE_DIR") or os.getenv(
+                "MAAPACMAN_FIRST_UPDATE_GATE_DIR"
+            )
+            gate_steps = _parse_update_gate_global_steps(
+                os.getenv("MAAPACMAN_UPDATE_GATE_GLOBAL_STEPS"),
+                os.getenv("MAAPACMAN_FIRST_UPDATE_GATE_GLOBAL_STEP", "16"),
+            )
+            if gate_dir and global_step in gate_steps:
+                os.makedirs(gate_dir, exist_ok=True)
+                completed_iteration = global_step + 1
+                waiting_path = os.path.join(
+                    gate_dir, f"WAITING_AFTER_ITER{completed_iteration}"
+                )
+                allow_path = os.path.join(
+                    gate_dir, f"ALLOW_AFTER_ITER{completed_iteration}"
+                )
+                abort_path = os.path.join(
+                    gate_dir, f"ABORT_AFTER_ITER{completed_iteration}"
+                )
+                with open(waiting_path, "w", encoding="utf-8") as stream:
+                    stream.write(
+                        f"global_step={global_step}\n"
+                        f"utc={datetime.utcnow().isoformat()}Z\n"
+                    )
+                logger.info(
+                    "FIRST_UPDATE_GATE_WAIT global_step=%s waiting=%s allow=%s abort=%s",
+                    global_step,
+                    waiting_path,
+                    allow_path,
+                    abort_path,
+                )
+                while not os.path.exists(allow_path):
+                    if os.path.exists(abort_path):
+                        logger.warning(
+                            "FIRST_UPDATE_GATE_ABORT global_step=%s marker=%s",
+                            global_step,
+                            abort_path,
+                        )
+                        return
+                    time.sleep(5)
+                logger.info(
+                    "FIRST_UPDATE_GATE_RELEASE global_step=%s marker=%s",
+                    global_step,
+                    allow_path,
                 )
 
             # Resume rollout
