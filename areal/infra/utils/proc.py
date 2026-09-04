@@ -85,7 +85,13 @@ def build_streaming_log_cmd(
         sed_prefix = f"stdbuf -oL sed 's/^/{log_prefix}/'"
     else:
         sed_prefix = f"sed 's/^/{log_prefix}/'"
-    shell_cmd = f"{full_cmd} 2>&1 | tee -a {log_file} >({sed_prefix} >> {merged_log})"
+    # Without pipefail, the wrapper reports tee's status and masks a Python
+    # worker crash or signal as a successful exit.  Schedulers must observe the
+    # leftmost command's real failure to preserve useful worker diagnostics.
+    shell_cmd = (
+        "set -o pipefail; "
+        f"{full_cmd} 2>&1 | tee -a {log_file} >({sed_prefix} >> {merged_log})"
+    )
     return shell_cmd
 
 

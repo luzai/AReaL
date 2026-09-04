@@ -122,6 +122,53 @@ def _dispatch_tensors(
     return splits, group_indices
 
 
+def _dispatch_ppo_tensors(
+    item_list: list[dict[str, Any]], dp_size: int
+) -> tuple[list[list[dict[str, Any]]], list[list[int]]]:
+    """Token-balance independent PPO sequences with uneven per-rank counts.
+
+    Unlike the generic dispatcher, PPO sequence rows are no longer atomic
+    prompt groups after advantage computation. Their total need not be
+    divisible by data-parallel size. A deterministic LPT pass assigns each row
+    to the rank with the smallest current token load.
+    """
+
+    n_items = len(item_list)
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if n_items < dp_size:
+        raise ValueError(
+            f"PPO sequence count ({n_items}) must be >= dp_size ({dp_size})"
+        )
+
+    token_weights = [_item_weight(item) for item in item_list]
+    sorted_indices = sorted(range(n_items), key=lambda i: (-token_weights[i], i))
+
+    group_indices: list[list[int]] = [[] for _ in range(dp_size)]
+    group_weights = [0] * dp_size
+    for item_index in sorted_indices:
+        rank = min(
+            range(dp_size),
+            key=lambda candidate: (
+                group_weights[candidate],
+                len(group_indices[candidate]),
+                candidate,
+            ),
+        )
+        group_indices[rank].append(item_index)
+        group_weights[rank] += token_weights[item_index]
+
+    if sorted(index for indices in group_indices for index in indices) != list(
+        range(n_items)
+    ):
+        raise RuntimeError("PPO sequence dispatch lost or duplicated an input row")
+    if any(not indices for indices in group_indices):
+        raise RuntimeError("PPO sequence dispatch produced an empty DP rank")
+
+    splits = [[item_list[index] for index in indices] for indices in group_indices]
+    return splits, group_indices
+
+
 def _pad_eval_batch(
     args: tuple[Any, ...], dp_size: int, group_size: int = 1
 ) -> tuple[Any, ...]:
@@ -483,6 +530,21 @@ class TrainController:
         )
         return self._collect_results(results, group_indices)
 
+    def _custom_ppo_function_call(
+        self,
+        method: str,
+        *args,
+        rpc_meta: dict[str, Any] | None = None,
+        **kwargs,
+    ):
+        """Dispatch post-advantage PPO rows without requiring N % DP == 0."""
+
+        dp_args, dp_kwargs, group_indices = self._prepare_ppo_dispatch(*args, **kwargs)
+        results = run_async_task(
+            self._call_workers, method, dp_args, dp_kwargs, rpc_meta=rpc_meta
+        )
+        return self._collect_results(results, group_indices)
+
     async def _async_custom_function_call(
         self,
         method: str,
@@ -523,6 +585,49 @@ class TrainController:
         if _is_tensor_like(args) or _is_tensor_like(kwargs):
             return self._partition_inputs(group_size, *args, **kwargs)
         return self._replicate_inputs(*args, **kwargs)
+
+    def _prepare_ppo_dispatch(
+        self, *args, **kwargs
+    ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]] | None]:
+        """Prepare PPO row dispatch with token-balanced uneven rank counts."""
+
+        if "_ppo_target_batch_size" in kwargs:
+            raise ValueError(
+                "_ppo_target_batch_size is reserved for PPO controller dispatch"
+            )
+        if _is_tensor_like(args) or _is_tensor_like(kwargs):
+            dp_args, dp_kwargs, group_indices = self._partition_ppo_inputs(
+                *args, **kwargs
+            )
+            target_batch_size = max(len(indices) for indices in group_indices)
+            dp_kwargs["_ppo_target_batch_size"] = [
+                target_batch_size
+            ] * self.parallel_strategy.dp_size
+            return dp_args, dp_kwargs, group_indices
+        return self._replicate_inputs(*args, **kwargs)
+
+    def _partition_ppo_inputs(
+        self, *args, **kwargs
+    ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]]]:
+        """Partition independent post-advantage PPO rows across DP ranks."""
+
+        dp_size = self.parallel_strategy.dp_size
+        group_indices: list[list[int]] | None = None
+
+        def _split(item: Any) -> list[Any]:
+            nonlocal group_indices
+            if _is_tensor_like(item):
+                if group_indices is None:
+                    splits, group_indices = _dispatch_ppo_tensors(item, dp_size)
+                    return splits
+                return [[item[i] for i in indices] for indices in group_indices]
+            return [item] * dp_size
+
+        dp_args = [_split(arg) for arg in args]
+        dp_kwargs = {key: _split(value) for key, value in kwargs.items()}
+        if group_indices is None:
+            raise RuntimeError("PPO tensor dispatch found no tensor-like input")
+        return dp_args, dp_kwargs, group_indices
 
     def _partition_inputs(
         self, group_size: int, /, *args, **kwargs

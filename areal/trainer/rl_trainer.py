@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import functools
+import json
+import math
 import os
 import time
 from collections.abc import Callable
@@ -10,6 +12,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
+import torch
 import torch.distributed as dist
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -47,6 +50,7 @@ from areal.infra import (
 from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
+from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
@@ -76,6 +80,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("RLTrainer")
 
+EPISODE_GRPO_ROLLOUT_FIELDS = (
+    "rollout_episode_ids",
+    "rollout_episode_returns",
+    "rollout_episode_group_sizes",
+)
+
+
+def _require_episode_grpo_fields(
+    batch: list[dict[str, Any]],
+    fields: tuple[str, ...],
+    *,
+    stage: str,
+) -> None:
+    """Fail closed when an episode-weighted batch loses reduction metadata."""
+    for index, trajectory in enumerate(batch):
+        missing = [field for field in fields if field not in trajectory]
+        if missing:
+            raise RuntimeError(
+                f"episode-weighted PPO {stage} item {index} is missing: {missing}"
+            )
+
 
 def _parse_update_gate_global_steps(
     value: str | None,
@@ -93,6 +118,576 @@ def _parse_update_gate_global_steps(
     if not steps or any(step < 0 for step in steps):
         raise ValueError(f"invalid managed update gate steps: {raw!r}")
     return steps
+
+
+def _compute_logp_in_rpc_chunks(
+    engine: Any,
+    batch: list[dict[str, Any]],
+    *,
+    role: str,
+    dp_size: int,
+) -> list[Any]:
+    """Bound controller-to-engine log-prob requests without breaking DP.
+
+    The environment variable is intentionally opt-in for backward
+    compatibility. Every request must contain a whole number of data-parallel
+    groups because all ranks participate in each compute_logp collective.
+    """
+
+    raw_chunk_size = os.getenv("MAAPACMAN_LOGP_RPC_CHUNK_SIZE")
+    if raw_chunk_size in (None, ""):
+        return engine.compute_logp(batch)
+    try:
+        chunk_size = int(raw_chunk_size)
+    except ValueError as exc:
+        raise ValueError(
+            "MAAPACMAN_LOGP_RPC_CHUNK_SIZE must be a positive integer"
+        ) from exc
+    if chunk_size <= 0 or chunk_size < dp_size or chunk_size % dp_size:
+        raise ValueError(
+            "MAAPACMAN_LOGP_RPC_CHUNK_SIZE must be a positive multiple "
+            f"of dp_size={dp_size}, got {chunk_size}"
+        )
+    # Rollout workflows group ``n_samples`` under each dataset row. Chunking
+    # the outer list alone would still send all samples in one RPC (for
+    # example, 4 rows x 12 samples = 48 sequences). Localize once, split the
+    # leading sample dimension, then restore the original grouped layout after
+    # every bounded RPC completes.
+    local_batch = RTensor.localize(batch)
+    group_sizes: list[int] = []
+    group_seqlens: list[int | None] = []
+    flat_seqlens: list[int | None] = []
+    flat_batch: list[dict[str, Any]] = []
+    for trajectory in local_batch:
+        attention_mask = trajectory.get("attention_mask")
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim >= 1:
+            group_size = int(attention_mask.shape[0])
+        else:
+            first_tensor = next(
+                (
+                    value
+                    for value in trajectory.values()
+                    if isinstance(value, torch.Tensor) and value.ndim >= 1
+                ),
+                None,
+            )
+            group_size = int(first_tensor.shape[0]) if first_tensor is not None else 1
+        group_sizes.append(group_size)
+        group_seqlens.append(
+            int(attention_mask.shape[-1])
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim >= 2
+            else None
+        )
+        for sample_index in range(group_size):
+            sample: dict[str, Any] = {}
+            for key, value in trajectory.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim >= 1
+                    and value.shape[0] == group_size
+                ):
+                    sample[key] = value[sample_index : sample_index + 1]
+                elif isinstance(value, list) and len(value) == group_size:
+                    sample[key] = [value[sample_index]]
+                else:
+                    sample[key] = value
+            sample_attention_mask = sample.get("attention_mask")
+            flat_seqlens.append(
+                int(sample_attention_mask.sum(-1).max().item())
+                if isinstance(sample_attention_mask, torch.Tensor)
+                and sample_attention_mask.ndim >= 2
+                else None
+            )
+            flat_batch.append(sample)
+
+    flat_results: list[Any] = []
+    n_chunks = (len(flat_batch) + chunk_size - 1) // chunk_size
+    for chunk_index, start in enumerate(range(0, len(flat_batch), chunk_size), 1):
+        chunk = flat_batch[start : start + chunk_size]
+        valid_size = len(chunk)
+        # A workflow group can contain a variable number of decision samples,
+        # so the flattened total need not be divisible by the DP world size.
+        # Every rank must still enter the final collective. Repeat the last
+        # read-only sample only for that RPC, then discard the padded results.
+        padding = (-valid_size) % dp_size
+        if padding:
+            chunk = [*chunk, *([chunk[-1]] * padding)]
+        logger.info(
+            "MAAPACMAN_LOGP_RPC_CHUNK role=%s chunk=%s/%s size=%s "
+            "valid_size=%s dp_size=%s",
+            role,
+            chunk_index,
+            n_chunks,
+            len(chunk),
+            valid_size,
+            dp_size,
+        )
+        chunk_results = RTensor.localize(engine.compute_logp(chunk))
+        if len(chunk_results) != len(chunk):
+            raise RuntimeError(
+                f"{role} compute_logp returned {len(chunk_results)} results "
+                f"for a chunk of {len(chunk)} trajectories"
+            )
+        flat_results.extend(chunk_results[:valid_size])
+
+    results: list[Any] = []
+    offset = 0
+    for group_size, group_seqlen in zip(group_sizes, group_seqlens, strict=True):
+        group = flat_results[offset : offset + group_size]
+        expected_seqlens = flat_seqlens[offset : offset + group_size]
+        offset += group_size
+        if not group or any(value is None for value in group):
+            results.append(None)
+        elif group_size == 1 and not isinstance(group[0], torch.Tensor):
+            results.append(group[0])
+        elif all(isinstance(value, torch.Tensor) for value in group):
+            # RTensor compacts each flattened trajectory independently before
+            # the RPC, so results from one original group can have different
+            # sequence widths. Restore its original compacted width before
+            # concatenating. Never crop an oversized result: that would hide a
+            # dispatch/reordering bug instead of failing closed.
+            normalized_group: list[torch.Tensor] = []
+            for value, expected_seqlen in zip(group, expected_seqlens, strict=True):
+                if group_seqlen is not None and value.ndim >= 2:
+                    result_seqlen = int(value.shape[-1])
+                    if expected_seqlen is not None and result_seqlen != expected_seqlen:
+                        raise RuntimeError(
+                            f"{role} compute_logp returned sequence width "
+                            f"{result_seqlen}, expected compacted input width "
+                            f"{expected_seqlen}"
+                        )
+                    if result_seqlen < group_seqlen:
+                        pad_shape = (
+                            *value.shape[:-1],
+                            group_seqlen - result_seqlen,
+                        )
+                        value = torch.cat((value, value.new_zeros(pad_shape)), dim=-1)
+                normalized_group.append(value)
+            results.append(
+                normalized_group[0]
+                if group_size == 1
+                else torch.cat(normalized_group, dim=0)
+            )
+        else:
+            raise TypeError(f"{role} compute_logp returned unsupported grouped results")
+    if offset != len(flat_results):
+        raise RuntimeError(
+            f"{role} compute_logp regrouped {offset} results but received "
+            f"{len(flat_results)}"
+        )
+    return results
+
+
+def _audit_pacman_logprob_alignment(
+    batch: list[dict[str, Any]],
+    *,
+    output_dir: str,
+    global_step: int,
+    max_abs_tolerance: float = 1.0e-3,
+    mean_abs_tolerance: float = 1.0e-4,
+    actor_reference_max_abs_tolerance: float = 1.0e-5,
+    actor_reference_mean_abs_tolerance: float = 1.0e-6,
+    acceptance_mode: str = "exact",
+    behavior_ratio_lower: float = 0.8,
+    behavior_ratio_upper: float = 1.25,
+    behavior_branch_mean_abs_log_ratio: float = 0.05,
+    behavior_max_filtered_fraction: float = 0.07,
+    singleton_max_abs_tolerance: float = 1.0e-7,
+    require_actor_reference_alignment: bool = True,
+    expected_option_tokens: int | None = None,
+) -> dict[str, Any]:
+    """Verify rollout, proximal actor, and reference option probabilities.
+
+    ``exact`` requires the inference and training backends to reproduce token
+    log-probabilities numerically. ``behavior`` still reports that exact check,
+    but evaluates compatibility using the same complete-option joint ratio and
+    sequence mask as PPO. Branching-token differences remain diagnostics; they
+    are not an additional rejection rule because token-level errors may cancel
+    in the joint probability of an atomic option. Behavior mode requires one
+    contiguous fixed-width option per sample so this audit matches sequence-level
+    masking.
+    """
+
+    if acceptance_mode not in {"exact", "behavior"}:
+        raise ValueError(
+            "Pacman log-prob acceptance_mode must be 'exact' or 'behavior'"
+        )
+    if not (0.0 < behavior_ratio_lower <= 1.0 <= behavior_ratio_upper):
+        raise ValueError(
+            "Pacman behavior ratio bounds must satisfy 0 < lower <= 1 <= upper"
+        )
+    if behavior_branch_mean_abs_log_ratio < 0.0:
+        raise ValueError("Pacman behavior mean log-ratio tolerance must be >= 0")
+    if not 0.0 <= behavior_max_filtered_fraction <= 1.0:
+        raise ValueError(
+            "Pacman behavior filtered-fraction tolerance must be in [0, 1]"
+        )
+
+    comparisons = {
+        "rollout_actor": [],
+        "rollout_reference": [],
+        "actor_reference": [],
+    }
+    records: list[dict[str, Any]] = []
+    support_sizes: set[int] = set()
+    for trajectory_index, trajectory in enumerate(batch):
+        required = {
+            "input_ids",
+            "loss_mask",
+            "logprobs",
+            "prox_logp",
+            "ref_logp",
+            "versions",
+            "pacman_allowed_token_ids",
+        }
+        missing = required - trajectory.keys()
+        if missing:
+            raise RuntimeError(
+                f"Pacman log-prob audit missing fields: {sorted(missing)}"
+            )
+        local = RTensor.localize({key: trajectory[key] for key in required})
+        input_ids = local["input_ids"].detach().cpu()
+        loss_mask = torch.roll(local["loss_mask"].detach().cpu().bool(), -1, dims=-1)
+        rollout = torch.roll(local["logprobs"].detach().cpu().float(), -1, dims=-1)
+        versions = torch.roll(local["versions"].detach().cpu(), -1, dims=-1)
+        actor = local["prox_logp"].detach().cpu().float()
+        reference = local["ref_logp"].detach().cpu().float()
+        sampled_ids = torch.roll(input_ids, -1, dims=-1)
+        supports = torch.roll(
+            local["pacman_allowed_token_ids"].detach().cpu(),
+            -1,
+            dims=-2,
+        )
+        if not (
+            rollout.shape
+            == actor.shape
+            == reference.shape
+            == loss_mask.shape
+            == sampled_ids.shape
+            == versions.shape
+            == supports.shape[:-1]
+        ):
+            raise RuntimeError("Pacman log-prob audit tensor shapes disagree")
+        support_active = supports.ne(0).any(dim=-1)
+        if not torch.equal(support_active, loss_mask):
+            raise RuntimeError(
+                "Pacman option supports do not match the generated-token mask"
+            )
+        for batch_index, token_index in loss_mask.nonzero().tolist():
+            encoded_support = supports[batch_index, token_index]
+            support = [
+                int(value) - 1 for value in encoded_support.tolist() if int(value) != 0
+            ]
+            sampled = int(sampled_ids[batch_index, token_index])
+            if sampled not in support or len(support) != len(set(support)):
+                raise RuntimeError(
+                    "sampled token is absent from its unique rollout support"
+                )
+            values = {
+                "rollout": float(rollout[batch_index, token_index]),
+                "actor": float(actor[batch_index, token_index]),
+                "reference": float(reference[batch_index, token_index]),
+            }
+            if not bool(torch.isfinite(torch.tensor(list(values.values()))).all()):
+                raise RuntimeError("Pacman log-prob audit found NaN or Inf")
+            comparisons["rollout_actor"].append(values["actor"] - values["rollout"])
+            comparisons["rollout_reference"].append(
+                values["reference"] - values["rollout"]
+            )
+            comparisons["actor_reference"].append(values["actor"] - values["reference"])
+            support_sizes.add(len(support))
+            records.append(
+                {
+                    "trajectory_index": trajectory_index,
+                    "sample_index": batch_index,
+                    "token_index": token_index,
+                    "sampled_token_id": sampled,
+                    "allowed_token_ids": support,
+                    "support_size": len(support),
+                    "version": int(versions[batch_index, token_index]),
+                    **values,
+                }
+            )
+    if not records:
+        raise RuntimeError("Pacman log-prob audit found no constrained tokens")
+    if not any(size > 1 for size in support_sizes):
+        raise RuntimeError("Pacman log-prob audit requires branching supports")
+    metrics = {}
+    exact_aligned = True
+    for name, deltas in comparisons.items():
+        absolute = [abs(value) for value in deltas]
+        ratios = [math.exp(value) for value in deltas]
+        relative = [abs(math.expm1(value)) for value in deltas]
+        max_abs = max(absolute)
+        mean_abs = sum(absolute) / len(absolute)
+        metrics[name] = {
+            "signed_mean_log_delta": sum(deltas) / len(deltas),
+            "max_abs_delta": max_abs,
+            "mean_abs_delta": mean_abs,
+            "min_importance_ratio": min(ratios),
+            "max_importance_ratio": max(ratios),
+            "max_abs_relative_probability_delta": max(relative),
+            "mean_abs_relative_probability_delta": (sum(relative) / len(relative)),
+        }
+        pair_max_tolerance = (
+            actor_reference_max_abs_tolerance
+            if name == "actor_reference"
+            else max_abs_tolerance
+        )
+        pair_mean_tolerance = (
+            actor_reference_mean_abs_tolerance
+            if name == "actor_reference"
+            else mean_abs_tolerance
+        )
+        metrics[name]["max_abs_tolerance"] = pair_max_tolerance
+        metrics[name]["mean_abs_tolerance"] = pair_mean_tolerance
+        exact_aligned = exact_aligned and max_abs <= pair_max_tolerance
+        exact_aligned = exact_aligned and mean_abs <= pair_mean_tolerance
+
+    branching_records = [record for record in records if record["support_size"] > 1]
+    singleton_records = [record for record in records if record["support_size"] == 1]
+    branching_log_ratios = [
+        record["actor"] - record["rollout"] for record in branching_records
+    ]
+    branching_ratios = [math.exp(value) for value in branching_log_ratios]
+    would_filter_records = [
+        record
+        for record in records
+        if not behavior_ratio_lower
+        <= math.exp(record["actor"] - record["rollout"])
+        <= behavior_ratio_upper
+    ]
+    would_filter_fraction = len(would_filter_records) / len(records)
+    kept_branching_ratios = [
+        math.exp(record["actor"] - record["rollout"])
+        for record in branching_records
+        if behavior_ratio_lower
+        <= math.exp(record["actor"] - record["rollout"])
+        <= behavior_ratio_upper
+    ]
+    singleton_abs_deltas = [
+        abs(record["actor"] - record["rollout"]) for record in singleton_records
+    ]
+    singleton_abs_logps = [
+        abs(record[role])
+        for record in singleton_records
+        for role in ("rollout", "actor", "reference")
+    ]
+    transitivity_residuals = [
+        abs(
+            (record["actor"] - record["rollout"])
+            - (record["reference"] - record["rollout"])
+            - (record["actor"] - record["reference"])
+        )
+        for record in records
+    ]
+    option_records = []
+    for record in sorted(
+        records,
+        key=lambda item: (
+            item["trajectory_index"],
+            item["sample_index"],
+            item["token_index"],
+        ),
+    ):
+        if (
+            not option_records
+            or option_records[-1]["trajectory_index"] != record["trajectory_index"]
+            or option_records[-1]["sample_index"] != record["sample_index"]
+            or option_records[-1]["end_token_index"] + 1 != record["token_index"]
+        ):
+            option_records.append(
+                {
+                    "trajectory_index": record["trajectory_index"],
+                    "sample_index": record["sample_index"],
+                    "start_token_index": record["token_index"],
+                    "end_token_index": record["token_index"],
+                    "support_sizes": [],
+                    "joint_rollout_logp": 0.0,
+                    "joint_actor_logp": 0.0,
+                    "joint_reference_logp": 0.0,
+                }
+            )
+        option = option_records[-1]
+        option["end_token_index"] = record["token_index"]
+        option["support_sizes"].append(record["support_size"])
+        for role in ("rollout", "actor", "reference"):
+            option[f"joint_{role}_logp"] += record[role]
+    for option in option_records:
+        option["token_count"] = len(option["support_sizes"])
+        log_ratio = option["joint_actor_logp"] - option["joint_rollout_logp"]
+        option["actor_rollout_log_ratio"] = log_ratio
+        option["behavior_importance_ratio"] = math.exp(log_ratio)
+        for role in ("rollout", "actor", "reference"):
+            option[f"joint_{role}_probability"] = math.exp(option[f"joint_{role}_logp"])
+    sample_keys = {
+        (record["trajectory_index"], record["sample_index"]) for record in records
+    }
+    option_keys = {
+        (option["trajectory_index"], option["sample_index"])
+        for option in option_records
+    }
+    if len(option_records) != len(sample_keys) or option_keys != sample_keys:
+        raise RuntimeError(
+            "Pacman behavior audit requires exactly one contiguous option per sample"
+        )
+    if expected_option_tokens is not None and any(
+        option["token_count"] != expected_option_tokens for option in option_records
+    ):
+        raise RuntimeError(
+            "Pacman behavior audit found an unexpected option token count"
+        )
+    option_behavior_ratios = [
+        option["behavior_importance_ratio"] for option in option_records
+    ]
+    would_filter_options = [
+        option
+        for option in option_records
+        if not behavior_ratio_lower
+        <= option["behavior_importance_ratio"]
+        <= behavior_ratio_upper
+    ]
+    would_filter_option_fraction = len(would_filter_options) / len(option_records)
+    would_filter_option_keys = {
+        (option["trajectory_index"], option["sample_index"])
+        for option in would_filter_options
+    }
+    kept_option_branching_log_ratios = [
+        record["actor"] - record["rollout"]
+        for record in branching_records
+        if (record["trajectory_index"], record["sample_index"])
+        not in would_filter_option_keys
+    ]
+    kept_option_ratios = [
+        option["behavior_importance_ratio"]
+        for option in option_records
+        if behavior_ratio_lower
+        <= option["behavior_importance_ratio"]
+        <= behavior_ratio_upper
+    ]
+    actor_reference_aligned = (
+        metrics["actor_reference"]["max_abs_delta"] <= actor_reference_max_abs_tolerance
+        and metrics["actor_reference"]["mean_abs_delta"]
+        <= actor_reference_mean_abs_tolerance
+    )
+    behavior_metrics = {
+        "branching_tokens": len(branching_records),
+        "singleton_tokens": len(singleton_records),
+        "branching_mean_abs_log_ratio": sum(
+            abs(value) for value in branching_log_ratios
+        )
+        / len(branching_log_ratios),
+        "kept_option_branching_tokens": len(kept_option_branching_log_ratios),
+        "kept_option_branching_mean_abs_log_ratio": (
+            sum(abs(value) for value in kept_option_branching_log_ratios)
+            / len(kept_option_branching_log_ratios)
+            if kept_option_branching_log_ratios
+            else None
+        ),
+        "kept_option_branching_max_abs_log_ratio": (
+            max(abs(value) for value in kept_option_branching_log_ratios)
+            if kept_option_branching_log_ratios
+            else None
+        ),
+        "branching_min_importance_ratio": min(branching_ratios),
+        "branching_max_importance_ratio": max(branching_ratios),
+        "kept_branching_min_importance_ratio": (
+            min(kept_branching_ratios) if kept_branching_ratios else None
+        ),
+        "kept_branching_max_importance_ratio": (
+            max(kept_branching_ratios) if kept_branching_ratios else None
+        ),
+        "would_filter_token_count": len(would_filter_records),
+        "would_filter_fraction": would_filter_fraction,
+        "would_filter_option_count": len(would_filter_options),
+        "would_filter_option_fraction": would_filter_option_fraction,
+        "kept_option_min_importance_ratio": (
+            min(kept_option_ratios) if kept_option_ratios else None
+        ),
+        "kept_option_max_importance_ratio": (
+            max(kept_option_ratios) if kept_option_ratios else None
+        ),
+        "max_filtered_fraction": behavior_max_filtered_fraction,
+        "singleton_max_abs_delta": (
+            max(singleton_abs_deltas) if singleton_abs_deltas else 0.0
+        ),
+        "singleton_max_abs_logp": (
+            max(singleton_abs_logps) if singleton_abs_logps else 0.0
+        ),
+        "transitivity_max_abs_residual": max(transitivity_residuals),
+        "option_count": len(option_records),
+        "option_min_importance_ratio": min(option_behavior_ratios),
+        "option_max_importance_ratio": max(option_behavior_ratios),
+        "ratio_lower_bound": behavior_ratio_lower,
+        "ratio_upper_bound": behavior_ratio_upper,
+        "branching_mean_abs_log_ratio_tolerance": (behavior_branch_mean_abs_log_ratio),
+        "branching_mean_abs_log_ratio_within_diagnostic_tolerance": (
+            sum(abs(value) for value in branching_log_ratios)
+            / len(branching_log_ratios)
+            <= behavior_branch_mean_abs_log_ratio
+        ),
+        "singleton_max_abs_tolerance": singleton_max_abs_tolerance,
+    }
+    behavior_compatible = (
+        (actor_reference_aligned or not require_actor_reference_alignment)
+        and bool(kept_option_ratios)
+        and would_filter_option_fraction <= behavior_max_filtered_fraction
+        and behavior_metrics["singleton_max_abs_logp"] <= singleton_max_abs_tolerance
+        and behavior_metrics["transitivity_max_abs_residual"] <= 1.0e-7
+    )
+    accepted = exact_aligned if acceptance_mode == "exact" else behavior_compatible
+    version_values = sorted({record["version"] for record in records})
+    if len(version_values) != 1 or version_values[0] < 0:
+        raise RuntimeError(
+            f"Pacman log-prob audit found inconsistent versions: {version_values}"
+        )
+    report = {
+        "accepted": accepted,
+        "acceptance_mode": acceptance_mode,
+        "require_actor_reference_alignment": require_actor_reference_alignment,
+        "aligned": exact_aligned,
+        "behavior_compatible": behavior_compatible,
+        "global_step": global_step,
+        "tokens": len(records),
+        "support_sizes": sorted(support_sizes),
+        "versions": version_values,
+        "expected_option_tokens": expected_option_tokens,
+        "max_abs_tolerance": max_abs_tolerance,
+        "mean_abs_tolerance": mean_abs_tolerance,
+        "metrics": metrics,
+        "behavior_metrics": behavior_metrics,
+        "rejection_sampling_contract": {
+            "level": "sequence",
+            "action": "mask",
+            "metric": "ratio",
+            "agg": "sum",
+            "lower": behavior_ratio_lower,
+            "upper": behavior_ratio_upper,
+        },
+        "options": option_records,
+        "records": records,
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"global-step-{global_step:06d}.json")
+    with open(output_path, "x", encoding="utf-8") as stream:
+        json.dump(report, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    if not accepted:
+        raise RuntimeError(
+            "Pacman log-prob alignment exceeded "
+            f"{acceptance_mode} acceptance limits; see {output_path}"
+        )
+    logger.info(
+        "MAAPACMAN_LOGPROB_ALIGNMENT_OK mode=%s exact=%s "
+        "behavior_compatible=%s global_step=%s tokens=%s report=%s",
+        acceptance_mode,
+        exact_aligned,
+        behavior_compatible,
+        global_step,
+        len(records),
+        output_path,
+    )
+    return report
 
 
 class _EmptyDataLoader:
@@ -707,7 +1302,14 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
+                    ref_logps = _compute_logp_in_rpc_chunks(
+                        self.ref,
+                        rollout_batch,
+                        role="ref",
+                        dp_size=ModelAllocation.from_str(
+                            config.ref.backend, name="ref"
+                        ).parallel.dp_size,
+                    )
                     for traj, logp in zip(rollout_batch, ref_logps):
                         traj["ref_logp"] = logp
                     self.ref.get_device_stats().log("ref logp")
@@ -725,7 +1327,12 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    teacher_logps = self.teacher.compute_logp(rollout_batch)
+                    teacher_logps = _compute_logp_in_rpc_chunks(
+                        self.teacher,
+                        rollout_batch,
+                        role="teacher",
+                        dp_size=self.teacher_alloc.parallel.dp_size,
+                    )
                     for traj, logp in zip(rollout_batch, teacher_logps):
                         traj["teacher_logp"] = logp
                         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
@@ -746,10 +1353,127 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    prox_logps = self.actor.compute_logp(rollout_batch)
+                    prox_logps = _compute_logp_in_rpc_chunks(
+                        self.actor,
+                        rollout_batch,
+                        role="actor",
+                        dp_size=self.actor_alloc.parallel.dp_size,
+                    )
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
+
+            alignment_dir = os.getenv("MAAPACMAN_LOGPROB_AUDIT_DIR")
+            alignment_steps = _parse_update_gate_global_steps(
+                os.getenv("MAAPACMAN_LOGPROB_AUDIT_GLOBAL_STEPS"),
+                "0",
+            )
+            if alignment_dir and global_step in alignment_steps:
+                if self.ref is None or not config.actor.should_compute_prox_logp():
+                    raise RuntimeError(
+                        "Pacman log-prob audit requires reference and proximal actor log-probs"
+                    )
+                acceptance_mode = os.getenv(
+                    "MAAPACMAN_LOGPROB_ACCEPTANCE_MODE", "exact"
+                )
+                behavior_ratio_lower = float(
+                    os.getenv("MAAPACMAN_LOGPROB_RATIO_LOWER", "0.8")
+                )
+                behavior_ratio_upper = float(
+                    os.getenv("MAAPACMAN_LOGPROB_RATIO_UPPER", "1.25")
+                )
+                if acceptance_mode == "behavior":
+                    rejection = config.actor.rejection_sampling
+                    reward_norm = config.actor.reward_norm
+                    reward_contract = getattr(config, "reward_objective_contract", None)
+                    episode_grpo_contract = (
+                        reward_contract == "episode_return_group_v1"
+                        and reward_norm is not None
+                        and reward_norm.mean_level == "group"
+                        and reward_norm.std_level == "group"
+                        and reward_norm.group_size == config.gconfig.n_samples
+                        and not reward_norm.mean_leave1out
+                        and config.actor.adv_norm is None
+                    )
+                    unnormalized_option_contract = (
+                        reward_contract
+                        in {
+                            "step_local_raw_v1",
+                            "option_return_raw_v1",
+                        }
+                        and reward_norm is None
+                        and config.actor.adv_norm is None
+                    )
+                    rejection_contract = (
+                        rejection is not None
+                        and rejection.level == "sequence"
+                        and rejection.action == "mask"
+                        and rejection.metric == "ratio"
+                        and rejection.agg == "sum"
+                        and rejection.lower is not None
+                        and rejection.lower == behavior_ratio_lower
+                        and rejection.upper == behavior_ratio_upper
+                    )
+                    behavior_training_contract = (
+                        config.actor.use_decoupled_loss
+                        and config.actor.prox_logp_method == "recompute"
+                        and config.actor.kl_logprob_source == "proximal"
+                        and not config.actor.use_sapo_loss
+                        and not config.actor.use_cispo_loss
+                        and config.actor.ppo_n_minibatches == 1
+                        and (episode_grpo_contract or unnormalized_option_contract)
+                        and config.critic is None
+                        and config.teacher is None
+                    )
+                    if not behavior_training_contract or not rejection_contract:
+                        raise RuntimeError(
+                            "Pacman behavior acceptance requires matching "
+                            "decoupled option-joint rejection and proximal KL"
+                        )
+                _audit_pacman_logprob_alignment(
+                    rollout_batch,
+                    output_dir=alignment_dir,
+                    global_step=global_step,
+                    max_abs_tolerance=float(
+                        os.getenv("MAAPACMAN_LOGPROB_MAX_ABS_TOLERANCE", "1e-3")
+                    ),
+                    mean_abs_tolerance=float(
+                        os.getenv("MAAPACMAN_LOGPROB_MEAN_ABS_TOLERANCE", "1e-4")
+                    ),
+                    actor_reference_max_abs_tolerance=float(
+                        os.getenv("MAAPACMAN_ACTOR_REF_MAX_ABS_TOLERANCE", "1e-5")
+                    ),
+                    actor_reference_mean_abs_tolerance=float(
+                        os.getenv("MAAPACMAN_ACTOR_REF_MEAN_ABS_TOLERANCE", "1e-6")
+                    ),
+                    acceptance_mode=acceptance_mode,
+                    behavior_ratio_lower=behavior_ratio_lower,
+                    behavior_ratio_upper=behavior_ratio_upper,
+                    behavior_branch_mean_abs_log_ratio=float(
+                        os.getenv(
+                            "MAAPACMAN_LOGPROB_BRANCH_MEAN_ABS_LOG_RATIO",
+                            "0.05",
+                        )
+                    ),
+                    behavior_max_filtered_fraction=float(
+                        os.getenv("MAAPACMAN_LOGPROB_MAX_FILTERED_FRACTION", "0.07")
+                    ),
+                    singleton_max_abs_tolerance=float(
+                        os.getenv(
+                            "MAAPACMAN_LOGPROB_SINGLETON_MAX_ABS_TOLERANCE",
+                            "1e-7",
+                        )
+                    ),
+                    require_actor_reference_alignment=os.getenv(
+                        "MAAPACMAN_REQUIRE_ACTOR_REFERENCE_ALIGNMENT", "1"
+                    )
+                    .strip()
+                    .lower()
+                    not in {"0", "false", "no"},
+                    expected_option_tokens=int(
+                        os.getenv("MAAPACMAN_EXPECTED_OPTION_TOKENS", "1")
+                    ),
+                )
 
             with (
                 stats_tracker.record_timing("compute_advantage"),
@@ -759,7 +1483,52 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                adv_batch = self.actor.compute_advantages(rollout_batch)
+                if (
+                    getattr(config, "reward_objective_contract", None)
+                    == "episode_return_group_v1"
+                ):
+                    _require_episode_grpo_fields(
+                        rollout_batch,
+                        EPISODE_GRPO_ROLLOUT_FIELDS,
+                        stage="rollout",
+                    )
+                elif (
+                    getattr(config, "reward_objective_contract", None)
+                    == "option_return_raw_v1"
+                ):
+                    _require_episode_grpo_fields(
+                        rollout_batch,
+                        ("rollout_episode_ids",),
+                        stage="rollout",
+                    )
+                repartition_for_ppo = (
+                    is_single_controller()
+                    and self.actor_alloc.parallel.dp_size > 1
+                    and getattr(config, "reward_objective_contract", None)
+                    in {"option_return_raw_v1", "episode_return_group_v1"}
+                )
+                if repartition_for_ppo:
+                    adv_batch = self.actor.compute_advantages(
+                        rollout_batch, repartition_for_ppo=True
+                    )
+                    logger.info(
+                        "PPO_OPTION_SEQUENCE_REPARTITION prompt_groups=%s "
+                        "option_sequences=%s actor_dp=%s",
+                        len(rollout_batch),
+                        len(adv_batch),
+                        self.actor_alloc.parallel.dp_size,
+                    )
+                else:
+                    adv_batch = self.actor.compute_advantages(rollout_batch)
+                if getattr(config, "reward_objective_contract", None) in {
+                    "option_return_raw_v1",
+                    "episode_return_group_v1",
+                }:
+                    _require_episode_grpo_fields(
+                        adv_batch,
+                        ("episode_loss_weights",),
+                        stage="advantage",
+                    )
                 self.actor.get_device_stats().log("compute advantages")
 
             # ``adv_batch`` contains every field needed by actor/critic PPO.

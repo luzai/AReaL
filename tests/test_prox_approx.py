@@ -979,5 +979,341 @@ class TestComputeLogpMetricsLogging:
                 assert "behave_imp_weight" in key, f"Metric {key} uses wrong spelling"
 
 
+def test_proximal_kl_source_requires_computed_proximal_logp():
+    from areal.api.cli_args import PPOActorConfig
+
+    with pytest.raises(ValueError, match="kl_logprob_source='proximal'"):
+        PPOActorConfig(kl_logprob_source="proximal")
+    with pytest.raises(ValueError, match="kl_logprob_source='proximal'"):
+        PPOActorConfig(
+            kl_logprob_source="proximal",
+            use_decoupled_loss=True,
+            prox_logp_method="loglinear",
+        )
+
+    config = PPOActorConfig(
+        kl_logprob_source="proximal",
+        use_decoupled_loss=True,
+        prox_logp_method="recompute",
+    )
+    assert config.should_compute_prox_logp()
+
+    with pytest.raises(ValueError, match="kl_logprob_source must be"):
+        PPOActorConfig(kl_logprob_source="unknown")
+
+
+def test_proximal_kl_source_excludes_rollout_backend_delta():
+    from unittest.mock import MagicMock
+
+    from areal.api.cli_args import PPOActorConfig
+    from areal.trainer.ppo.actor import PPOActor
+
+    def run(source: str, proximal: torch.Tensor) -> torch.Tensor:
+        config = PPOActorConfig(
+            backend="fsdp:d1",
+            use_decoupled_loss=True,
+            prox_logp_method="recompute",
+            kl_logprob_source=source,
+            kl_ctl=1.0,
+            kl_estimator="k1",
+        )
+        actor = PPOActor(config, MagicMock())
+        data = {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "attention_mask": torch.ones(1, 4, dtype=torch.bool),
+            # Sample-token convention; _compute_advantages rolls this left.
+            "loss_mask": torch.tensor([[0, 0, 1, 1]], dtype=torch.bool),
+            "logprobs": torch.tensor([[0.0, 0.0, -4.0, -5.0]]),
+            # Proximal/reference logps are already causal-position aligned.
+            "prox_logp": proximal.clone(),
+            "ref_logp": torch.zeros(1, 4),
+            "rewards": torch.zeros(1),
+        }
+        return actor._compute_advantages(data)["kl_rewards"]
+
+    proximal_equal_ref = run("proximal", torch.zeros(1, 4))
+    torch.testing.assert_close(proximal_equal_ref, torch.zeros(1, 4))
+
+    rollout_delta = run("rollout", torch.zeros(1, 4))
+    torch.testing.assert_close(rollout_delta, torch.tensor([[0.0, 4.0, 5.0, 0.0]]))
+
+    proximal_delta = run("proximal", torch.tensor([[0.0, 0.2, -0.1, 0.0]]))
+    torch.testing.assert_close(proximal_delta, torch.tensor([[0.0, -0.2, 0.1, 0.0]]))
+
+
+def _whole_episode_grpo_actor(group_size: int = 2):
+    from unittest.mock import MagicMock
+
+    from areal.api.cli_args import NormConfig, PPOActorConfig
+    from areal.trainer.ppo.actor import PPOActor
+
+    config = PPOActorConfig(
+        backend="fsdp:d1",
+        kl_ctl=0.0,
+        use_decoupled_loss=True,
+        prox_logp_method="recompute",
+        reward_norm=NormConfig(
+            mean_level="group",
+            std_level="group",
+            std_unbiased=False,
+            group_size=group_size,
+        ),
+        adv_norm=None,
+    )
+    return PPOActor(config, MagicMock())
+
+
+def _whole_episode_grpo_data():
+    batch_size = 6
+    return {
+        "input_ids": torch.ones(batch_size, 3, dtype=torch.long),
+        "attention_mask": torch.ones(batch_size, 3, dtype=torch.bool),
+        "loss_mask": torch.tensor([[0, 0, 1]] * batch_size, dtype=torch.bool),
+        "logprobs": torch.zeros(batch_size, 3),
+        "ref_logp": torch.zeros(batch_size, 3),
+        # The first initial-state group contains two decisions from episode 10
+        # and one from episode 11. The second group has the inverse lengths.
+        "rewards": torch.tensor([1.0, 1.0, 3.0, 10.0, 14.0, 14.0]),
+        "rollout_episode_ids": torch.tensor([10, 10, 11, 20, 21, 21]),
+        "rollout_episode_returns": torch.tensor([1.0, 1.0, 3.0, 10.0, 14.0, 14.0]),
+        "rollout_episode_group_sizes": torch.tensor([2, 2, 2, 2, 2, 2]),
+    }
+
+
+def test_whole_episode_grpo_normalizes_unique_returns_then_broadcasts():
+    from areal.trainer.ppo.actor import _actor_loss_weight
+    from areal.utils.data import TrajBatchMeta
+
+    actor = _whole_episode_grpo_actor()
+    data = _whole_episode_grpo_data()
+    meta = TrajBatchMeta(
+        n_trajs=2,
+        traj_group_sizes=[3, 3],
+        traj_seqlens=[3, 3],
+    )
+
+    result = actor._compute_advantages(data, meta)
+
+    torch.testing.assert_close(
+        result["advantages"][:, 1],
+        torch.tensor([-1.0, -1.0, 1.0, -1.0, 1.0, 1.0]),
+        rtol=0.0,
+        atol=2e-5,
+    )
+    torch.testing.assert_close(
+        result["episode_loss_weights"],
+        torch.tensor(
+            [
+                [0.0, 0.5, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 0.5, 0.0],
+            ]
+        ),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        result["episode_loss_weights"].sum(),
+        torch.tensor(4.0),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        _actor_loss_weight(result),
+        torch.tensor(4.0),
+        rtol=0.0,
+        atol=0.0,
+    )
+    for key in (
+        "rollout_episode_ids",
+        "rollout_episode_returns",
+        "rollout_episode_group_sizes",
+    ):
+        assert key not in result
+
+
+def test_whole_episode_grpo_rejects_incomplete_episode_group():
+    from areal.utils.data import TrajBatchMeta
+
+    actor = _whole_episode_grpo_actor()
+    data = _whole_episode_grpo_data()
+    data["rollout_episode_ids"][2] = 10
+    meta = TrajBatchMeta(
+        n_trajs=2,
+        traj_group_sizes=[3, 3],
+        traj_seqlens=[3, 3],
+    )
+
+    with pytest.raises(ValueError, match="expected=2 actual=1"):
+        actor._compute_advantages(data, meta)
+
+
+def test_option_return_raw_builds_equal_episode_loss_weights_without_norm():
+    """Raw option returns keep their values while long games lose extra mass."""
+    from unittest.mock import MagicMock
+
+    from areal.api.cli_args import PPOActorConfig
+    from areal.trainer.ppo.actor import PPOActor, _actor_loss_weight
+
+    actor = PPOActor(
+        PPOActorConfig(
+            backend="fsdp:d1",
+            kl_ctl=0.0,
+            use_decoupled_loss=True,
+            prox_logp_method="recompute",
+            reward_norm=None,
+            adv_norm=None,
+        ),
+        MagicMock(),
+    )
+    data = _whole_episode_grpo_data()
+    del data["rollout_episode_returns"]
+    del data["rollout_episode_group_sizes"]
+    expected_rewards = data["rewards"].clone()
+
+    result = actor._compute_advantages(data)
+
+    torch.testing.assert_close(result["rewards"], expected_rewards)
+    torch.testing.assert_close(
+        result["episode_loss_weights"],
+        torch.tensor(
+            [
+                [0.0, 0.5, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 0.5, 0.0],
+            ]
+        ),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        _actor_loss_weight(result), torch.tensor(4.0), rtol=0.0, atol=0.0
+    )
+    assert "rollout_episode_ids" not in result
+
+
+def test_compute_logp_strips_whole_episode_metadata_from_model_inputs():
+    actor = _whole_episode_grpo_actor()
+    data = _whole_episode_grpo_data()
+    actor.engine.forward.return_value = torch.zeros(6, 3)
+
+    actor._compute_logp(data)
+
+    forwarded = actor.engine.forward.call_args.kwargs["input_"]
+    for key in (
+        "rollout_episode_ids",
+        "rollout_episode_returns",
+        "rollout_episode_group_sizes",
+    ):
+        assert key not in forwarded
+        assert key in data
+
+
+def test_episode_loss_reducer_equalizes_long_and_short_episodes():
+    """Two- and one-token episodes should each contribute one sample mean."""
+    from areal.utils.functional import ppo_actor_loss_fn
+
+    logprobs = torch.zeros(3)
+    loss, _ = ppo_actor_loss_fn(
+        logprobs=logprobs,
+        proximal_logprobs=torch.zeros_like(logprobs),
+        old_logprobs=torch.zeros_like(logprobs),
+        advantages=torch.tensor([-1.0, -3.0, -10.0]),
+        eps_clip=0.2,
+        loss_mask=torch.ones(3, dtype=torch.bool),
+        loss_reduction_weights=torch.tensor([0.5, 0.5, 1.0]),
+    )
+
+    # Episode 1 mean is (1 + 3) / 2 = 2; episode 2 mean is 10.
+    # Equal episode reduction is therefore (2 + 10) / 2 = 6, rather than
+    # the legacy per-token mean (1 + 3 + 10) / 3.
+    torch.testing.assert_close(loss, torch.tensor(6.0), rtol=0.0, atol=0.0)
+
+
+def test_grpo_loss_uses_episode_reduction_weights():
+    """The actor entry point must forward episode weights to the PPO reducer."""
+    from unittest.mock import patch
+
+    from areal.trainer.ppo.actor import grpo_loss_fn
+    from areal.utils.stats_tracker import DistributedStatsTracker
+
+    logprobs = torch.zeros(3)
+    with patch("areal.trainer.ppo.actor.stats_tracker", DistributedStatsTracker()):
+        loss = grpo_loss_fn(
+            logprobs=logprobs,
+            entropy=torch.zeros_like(logprobs),
+            input_data={
+                "logprobs": torch.zeros_like(logprobs),
+                "prox_logp": torch.zeros_like(logprobs),
+                "advantages": torch.tensor([-1.0, -3.0, -10.0]),
+                "loss_mask": torch.ones(3, dtype=torch.bool),
+                "episode_loss_weights": torch.tensor([0.5, 0.5, 1.0]),
+            },
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+        )
+
+    torch.testing.assert_close(loss, torch.tensor(6.0), rtol=0.0, atol=0.0)
+
+
+def test_whole_episode_runtime_metadata_gate_fails_closed():
+    """The trainer must not silently fall back to decision-level normalization."""
+    from areal.trainer.rl_trainer import _require_episode_grpo_fields
+
+    _require_episode_grpo_fields(
+        [{"episode_loss_weights": torch.ones(1)}],
+        ("episode_loss_weights",),
+        stage="advantage",
+    )
+    with pytest.raises(RuntimeError, match="rollout_episode_returns"):
+        _require_episode_grpo_fields(
+            [{"rollout_episode_ids": torch.ones(1)}],
+            ("rollout_episode_ids", "rollout_episode_returns"),
+            stage="rollout",
+        )
+
+
+def test_episode_loss_reducer_does_not_renormalize_after_rejection():
+    """A rejected episode keeps its original denominator mass."""
+    from areal.api.cli_args import RejectionSamplingConfig
+    from areal.utils.functional import ppo_actor_loss_fn
+
+    proximal = torch.tensor([[0.6931471805599453], [0.0]])
+    loss, stat = ppo_actor_loss_fn(
+        logprobs=proximal.clone(),
+        proximal_logprobs=proximal,
+        old_logprobs=torch.zeros_like(proximal),
+        advantages=torch.tensor([[-4.0], [-10.0]]),
+        eps_clip=0.2,
+        loss_mask=torch.ones_like(proximal, dtype=torch.bool),
+        rejection_sampling=RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            metric="ratio",
+            agg="sum",
+            lower=0.8,
+            upper=1.25,
+        ),
+        loss_reduction_weights=torch.ones_like(proximal),
+    )
+
+    # The first episode is rejected (behavior ratio 2.0). Its numerator is zero,
+    # while the original two-episode denominator remains 2: 10 / 2 = 5.
+    torch.testing.assert_close(loss, torch.tensor(5.0), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        stat["behave_mask"],
+        torch.tensor([[False], [True]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

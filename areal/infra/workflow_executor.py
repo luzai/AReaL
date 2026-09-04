@@ -666,11 +666,45 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         Raises
         ------
         RuntimeError
-            If the input generator is exhausted before the batch is complete.
+            If the input generator is exhausted before the batch is complete, or
+            if rejected groups exceed ``MAAPACMAN_MAX_REJECTED_GROUPS`` when that
+            environment variable is configured.
+        ValueError
+            If ``MAAPACMAN_MAX_REJECTED_GROUPS`` is not a non-negative integer.
         """
+        max_rejected_groups_raw = os.getenv("MAAPACMAN_MAX_REJECTED_GROUPS")
+        max_rejected_groups: int | None = None
+        if max_rejected_groups_raw is not None:
+            try:
+                max_rejected_groups = int(max_rejected_groups_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "MAAPACMAN_MAX_REJECTED_GROUPS must be a non-negative integer"
+                ) from exc
+            if max_rejected_groups < 0:
+                raise ValueError(
+                    "MAAPACMAN_MAX_REJECTED_GROUPS must be a non-negative integer"
+                )
+
         accepted_cnt = 0
+        rejected_cnt = 0
         total_attempts = 0
-        results = []
+        results: list[TResult] = []
+
+        def log_group_audit(status: str, *, error: bool = False) -> None:
+            if max_rejected_groups is None:
+                return
+            message = (
+                "MAAPACMAN_ROLLOUT_GROUP_AUDIT "
+                f"status={status} attempts={total_attempts} "
+                f"accepted={accepted_cnt} rejected={rejected_cnt} "
+                f"max_rejected_groups={max_rejected_groups} "
+                f"dynamic_bs={int(dynamic_bs)} batch_size={batch_size}"
+            )
+            if error:
+                self.logger.error(message)
+            else:
+                self.logger.info(message)
 
         while True:
             # Submit tasks to maintain overlap
@@ -701,23 +735,36 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                             "Use cycle_dataloader() or provide an infinite generator."
                         ) from None
             try:
-                arrived = self.wait_results(count=batch_size - accepted_cnt, timeout=1)
+                wait_count = (
+                    1 if max_rejected_groups is not None else batch_size - accepted_cnt
+                )
+                arrived = self.wait_results(count=wait_count, timeout=1)
             except TimeoutError:
                 arrived = []
 
             for res in arrived:
                 is_accepted = res is not None
+                total_attempts += 1
 
                 if not is_accepted:
+                    rejected_cnt += 1
+                    if (
+                        max_rejected_groups is not None
+                        and rejected_cnt > max_rejected_groups
+                    ):
+                        log_group_audit("rejected_limit_exceeded", error=True)
+                        raise RuntimeError(
+                            "rollout group rejection limit exceeded: "
+                            f"rejected={rejected_cnt} "
+                            f"max_rejected_groups={max_rejected_groups}"
+                        )
                     if dynamic_bs:
-                        total_attempts += 1
                         if total_attempts >= batch_size:
                             break
                     continue
 
                 # Accepted sample
                 accepted_cnt += 1
-                total_attempts += 1
                 results.append(res)
 
                 if dynamic_bs:
@@ -729,6 +776,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 continue
             break
 
+        log_group_audit("complete")
         return results
 
 

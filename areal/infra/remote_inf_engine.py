@@ -89,18 +89,14 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
             *[self.workflow.arun_episode(engine, data) for _ in range(self.group_size)]
         )
 
-        valid_results = [r for r in results if r is not None]
-
-        # All results None -> return None
-        if not valid_results:
-            return None
-
-        # Some results None -> warn and continue with valid ones
-        if len(valid_results) < len(results):
+        if any(result is None for result in results):
             self.logger.warning(
-                f"GroupedRolloutWorkflow: {len(results) - len(valid_results)}/{len(results)} "
-                "trajectories returned None, using remaining results"
+                "GroupedRolloutWorkflow: at least one of "
+                f"{len(results)} trajectories returned None; rejecting the "
+                "entire semantic group"
             )
+            return None
+        valid_results = results
 
         # Check if results are InteractionWithTokenLogpReward dicts
         first = valid_results[0]

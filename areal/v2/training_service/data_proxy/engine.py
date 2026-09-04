@@ -43,15 +43,19 @@ def register_engine_routes(
 
     # -- dispatch helpers --------------------------------------------------
 
-    def _dispatch_compute_route(path: str, *, pad_eval_batch: bool = False):
+    def _dispatch_compute_route(
+        path: str, *, pad_eval_batch: bool = False, uneven_ppo: bool = False
+    ):
         async def handler(request: Request):
             dispatcher = app.state.dispatcher
             try:
                 body = await request.body()
                 return _raw_json_response(
-                    await dispatcher.dispatch(path, pad_eval_batch=pad_eval_batch).post(
-                        body
-                    )
+                    await dispatcher.dispatch(
+                        path,
+                        pad_eval_batch=pad_eval_batch,
+                        uneven_ppo=uneven_ppo,
+                    ).post(body)
                 )
             except Exception as exc:
                 return JSONResponse({"error": str(exc)}, status_code=502)
@@ -147,14 +151,18 @@ def register_engine_routes(
     app.post("/ppo/actor/compute_advantages")(
         _dispatch_compute_route("/ppo/actor/compute_advantages")
     )
-    app.post("/ppo/actor/update")(_dispatch_compute_route("/ppo/actor/update"))
+    app.post("/ppo/actor/update")(
+        _dispatch_compute_route("/ppo/actor/update", uneven_ppo=True)
+    )
 
     # -- PPO critic routes -------------------------------------------------
 
     app.post("/ppo/critic/compute_values")(
         _dispatch_compute_route("/ppo/critic/compute_values")
     )
-    app.post("/ppo/critic/update")(_dispatch_compute_route("/ppo/critic/update"))
+    app.post("/ppo/critic/update")(
+        _dispatch_compute_route("/ppo/critic/update", uneven_ppo=True)
+    )
 
     # -- RW routes ---------------------------------------------------------
 

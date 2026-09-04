@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from areal.api.cli_args import RejectionSamplingConfig
-from areal.utils.functional import apply_rejection_sampling
+from areal.utils.functional import apply_rejection_sampling, ppo_actor_loss_fn
 
 
 class TestRejectionSamplingConfig:
@@ -139,6 +139,115 @@ class TestRejectionSamplingMask:
         torch.testing.assert_close(
             result.behave_imp_weight[3:],
             torch.ones(2),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_sequence_ratio_sum_uses_joint_option_weight(self):
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            agg="sum",
+            metric="ratio",
+            lower=0.5,
+            upper=4.0,
+        )
+        proximal_logprobs = torch.tensor([[0.0, 0.2, 0.3]])
+        old_logprobs = torch.zeros(1, 3)
+        loss_mask = torch.ones(1, 3)
+
+        result = apply_rejection_sampling(
+            proximal_logprobs,
+            old_logprobs,
+            loss_mask,
+            cu_seqlens=None,
+            config=config,
+        )
+
+        expected_weight = torch.exp(torch.tensor(0.5))
+        torch.testing.assert_close(
+            result.behave_imp_weight[0],
+            expected_weight.expand(3),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_sequence_ratio_sum_uses_joint_option_weight_1d_packed(self):
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            agg="sum",
+            metric="ratio",
+            lower=0.5,
+            upper=4.0,
+        )
+        proximal_logprobs = torch.tensor([0.1, 0.2, 0.0, -0.1, 0.0])
+        old_logprobs = torch.zeros(5)
+        loss_mask = torch.ones(5)
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+        result = apply_rejection_sampling(
+            proximal_logprobs,
+            old_logprobs,
+            loss_mask,
+            cu_seqlens=cu_seqlens,
+            config=config,
+        )
+
+        torch.testing.assert_close(
+            result.behave_imp_weight[:3],
+            torch.exp(torch.tensor(0.3)).expand(3),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            result.behave_imp_weight[3:],
+            torch.exp(torch.tensor(-0.1)).expand(2),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    def test_sequence_ratio_sum_masks_rejected_option_gradient(self):
+        config = RejectionSamplingConfig(
+            level="sequence",
+            action="mask",
+            agg="sum",
+            metric="ratio",
+            lower=0.8,
+            upper=1.25,
+        )
+        # All seven individual ratios in option 0 are only 1.04 and therefore
+        # pass the token bounds, but their joint ratio 1.04**7 > 1.25. The
+        # complete option must be removed. Option 1 has joint ratio 1.01**7 and
+        # remains, with that joint weight broadcast to all seven option tokens.
+        current_logprobs = torch.zeros(2, 9, requires_grad=True)
+        proximal_logprobs = torch.zeros(2, 9)
+        old_logprobs = torch.zeros(2, 9)
+        proximal_logprobs[0, 1:8] = torch.log(torch.tensor(1.04))
+        proximal_logprobs[1, 1:8] = torch.log(torch.tensor(1.01))
+        loss_mask = torch.zeros(2, 9, dtype=torch.bool)
+        loss_mask[:, 1:8] = True
+
+        loss, stats = ppo_actor_loss_fn(
+            logprobs=current_logprobs,
+            proximal_logprobs=proximal_logprobs,
+            old_logprobs=old_logprobs,
+            advantages=torch.ones(2, 9),
+            loss_mask=loss_mask,
+            eps_clip=0.2,
+            rejection_sampling=config,
+        )
+        loss.backward()
+
+        assert stats["filtered_fraction"] == pytest.approx(0.5)
+        assert torch.count_nonzero(current_logprobs.grad[0]) == 0
+        assert torch.all(torch.isfinite(current_logprobs.grad))
+        assert torch.all(current_logprobs.grad[1, 1:8] != 0)
+        assert current_logprobs.grad[1, 0] == 0
+        assert current_logprobs.grad[1, 8] == 0
+        torch.testing.assert_close(
+            stats["behave_imp_weight"][1, 1:8],
+            torch.full((7,), 1.01**7),
             rtol=1e-5,
             atol=1e-5,
         )
@@ -750,12 +859,28 @@ class TestEdgeCases:
 
         assert result.loss_mask[0, 0] == 1.0  # exactly at boundary, kept
 
-    def test_nan_from_inf_logprobs(self):
-        """Non-finite log-probs (both -inf) should not produce NaN."""
+    def test_active_nonfinite_logprobs_fail_closed(self):
+        """An active non-finite log-prob must not be treated as ratio one."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=5.0)
         proximal_logprobs = torch.tensor([[0.0, float("-inf")]])
         old_logprobs = torch.tensor([[0.0, float("-inf")]])
         loss_mask = torch.ones(1, 2)
+
+        with pytest.raises(ValueError, match="non-finite active"):
+            apply_rejection_sampling(
+                proximal_logprobs,
+                old_logprobs,
+                loss_mask,
+                cu_seqlens=None,
+                config=config,
+            )
+
+    def test_inactive_nonfinite_logprobs_remain_safe(self):
+        """Prompt/padding sentinels remain neutral when their mask is zero."""
+        config = RejectionSamplingConfig(level="token", metric="ratio", upper=5.0)
+        proximal_logprobs = torch.tensor([[0.0, float("-inf")]])
+        old_logprobs = torch.tensor([[0.0, float("-inf")]])
+        loss_mask = torch.tensor([[1.0, 0.0]])
 
         result = apply_rejection_sampling(
             proximal_logprobs,
@@ -764,10 +889,9 @@ class TestEdgeCases:
             cu_seqlens=None,
             config=config,
         )
-
-        # No NaN in outputs
         assert not torch.isnan(result.behave_imp_weight).any()
         assert not torch.isnan(result.loss_mask).any()
+        assert result.behave_imp_weight[0, 1] == 0
 
     def test_all_masked_sequence_with_max_agg(self):
         """Sequence with all tokens masked should pass bounds check with max agg."""

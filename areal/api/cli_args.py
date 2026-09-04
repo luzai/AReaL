@@ -1361,9 +1361,8 @@ class RejectionSamplingConfig:
 
     Attributes:
         level: Filtering granularity ('token' or 'sequence'). When ``level='sequence'``
-            and ``metric='ratio'``, both the filtering decision and the correction
-            weight (behave_imp_weight) use the sequence-level geometric mean,
-            matching the old ``sequence_mask``/``sequence_truncate`` semantics.
+            and ``metric='ratio'``, ``agg='mean'`` uses the sequence-level
+            geometric mean, while ``agg='sum'`` uses the joint sequence ratio.
         action: Action mode ('mask' or 'clamp').
         metric: Divergence metric ('ratio', 'kl_k1', 'kl_k2', 'kl_k3').
         agg: Aggregation method for sequence-level ('sum', 'mean', 'max').
@@ -1380,8 +1379,9 @@ class RejectionSamplingConfig:
             "help": "Filtering granularity. "
             "'token': per-token filtering (each token judged independently). "
             "'sequence': per-sequence filtering (all tokens in a sequence share the same fate). "
-            "When metric='ratio', both the filtering decision and the correction weight "
-            "(behave_imp_weight) operate at sequence level using the geometric mean.",
+            "When metric='ratio', filtering and correction use the configured "
+            "log-space aggregation (geometric mean for agg='mean', joint ratio "
+            "for agg='sum').",
             "choices": ["token", "sequence"],
         },
     )
@@ -1587,6 +1587,14 @@ class PPOActorConfig(TrainEngineConfig):
         default="k1",
         metadata={"help": "KL divergence estimator", "choices": ["k1", "k2", "k3"]},
     )
+    kl_logprob_source: str = field(
+        default="rollout",
+        metadata={
+            "help": "Policy log-probabilities used for KL reward: rollout behavior "
+            "or recomputed proximal actor.",
+            "choices": ["rollout", "proximal"],
+        },
+    )
 
     # SAPO (Soft Adaptive Policy Optimization) - https://arxiv.org/abs/2511.20347
     use_sapo_loss: bool = field(
@@ -1706,10 +1714,18 @@ class PPOActorConfig(TrainEngineConfig):
 
         from areal.utils.constants import ProxLogpMethod
 
-        if (
-            ProxLogpMethod(self.prox_logp_method) == ProxLogpMethod.REUSE_TRAIN_LOGP
-            and self.ppo_n_minibatches > 1
+        if self.kl_logprob_source not in {"rollout", "proximal"}:
+            raise ValueError("kl_logprob_source must be either 'rollout' or 'proximal'")
+        method = ProxLogpMethod(self.prox_logp_method)
+        if self.kl_logprob_source == "proximal" and (
+            not self.use_decoupled_loss or method.skips_forward_pass()
         ):
+            raise ValueError(
+                "kl_logprob_source='proximal' requires decoupled loss and a "
+                "proximal method that performs compute_logp"
+            )
+
+        if method == ProxLogpMethod.REUSE_TRAIN_LOGP and self.ppo_n_minibatches > 1:
             logger.warning(
                 "prox_logp_method='reuse_train_logp' requires ppo_n_minibatches=1, "
                 f"but got ppo_n_minibatches={self.ppo_n_minibatches}. "
