@@ -596,6 +596,17 @@ class FSDPEngine(TrainEngine):
         return self._cpu_group
 
     def destroy(self):
+        if self._offload_depth != 0:
+            raise RuntimeError(
+                "Cannot destroy FSDPEngine with nonzero offload context depth: "
+                f"{self._offload_depth}"
+            )
+        if self.is_offload:
+            # TMS must remap paused allocations before model deletion/empty_cache.
+            # Do not use onload(): teardown must not add an onload barrier.
+            torch_memory_saver.resume()
+            self.is_offload = False
+            current_platform.synchronize()
         self._initialized = False
         if hasattr(self, "optimizer"):
             del self.optimizer
