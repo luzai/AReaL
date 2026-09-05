@@ -701,6 +701,8 @@ def split_padded_tensor_dict_into_mb_list(
     data: dict[str, Any],
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
+    *,
+    _seq_lens: list[int] | None = None,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -708,6 +710,9 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        _seq_lens: Internal batch-planning metadata computed from this exact
+            attention_mask. Reuse its CPU lengths without another device sync;
+            never populate this argument from external trajectory metadata.
 
     Returns:
         MicroBatchList: A structure containing the split micro-batches and metadata.
@@ -724,15 +729,26 @@ def split_padded_tensor_dict_into_mb_list(
     if bs % granularity != 0:
         raise RuntimeError(f"Batch size {bs} cannot divide granularity {granularity}.")
     max_seqlen = data["attention_mask"].shape[1]
-    seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
-    input_lens = (
-        data["attention_mask"]
-        .view(bs // granularity, granularity, -1)
-        .sum(dim=(1, 2))
-        .long()
-        .cpu()
-        .numpy()
-    )
+    if _seq_lens is None:
+        seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+        input_lens = (
+            data["attention_mask"]
+            .view(bs // granularity, granularity, -1)
+            .sum(dim=(1, 2))
+            .long()
+            .cpu()
+            .numpy()
+        )
+    else:
+        if len(_seq_lens) != bs or any(
+            type(length) is not int or not 0 < length <= max_seqlen
+            for length in _seq_lens
+        ):
+            raise ValueError("Invalid internal sequence-length planning metadata")
+        seq_lens = list(_seq_lens)
+        input_lens = (
+            np.asarray(seq_lens, dtype=np.int64).reshape(-1, granularity).sum(1)
+        )
 
     # check for multimodal input data
     multimodal_keys = {key for key in data if is_multi_modal_key(key)}

@@ -56,7 +56,12 @@ from areal.api import (
     WeightUpdateMeta,
     WorkflowLike,
 )
-from areal.api.cli_args import OptimizerConfig, PerfTracerConfig, TrainEngineConfig
+from areal.api.cli_args import (
+    MicroBatchSpec,
+    OptimizerConfig,
+    PerfTracerConfig,
+    TrainEngineConfig,
+)
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     aggregate_eval_losses,
@@ -216,6 +221,82 @@ def _prepare_multimodal_forward_inputs(
                 )
 
     _drop_multimodal_payloads(mb)
+
+
+def _qwen3_5_row_isolated_mb_spec(
+    attention_mask: torch.Tensor,
+    mb_spec: MicroBatchSpec,
+    *,
+    seq_lens: list[int] | None,
+    group: dist.ProcessGroup | None,
+    tree_training: bool = False,
+    sp_size: int = 1,
+) -> MicroBatchSpec:
+    """Isolate hybrid recurrent state without changing tokens or update counts.
+
+    All engine ranks exchange validation results before the packing collective.
+    Unequal row counts cannot use singleton micro-batches with synchronized FSDP
+    forwards: fail on every rank, rather than padding/repeating training samples.
+    Lengths come from batch planning and are reused by the splitter: validation
+    must not add a second GPU-to-CPU transfer. This adds one CPU collective per
+    call (including singleton log-prob RPCs).
+    """
+    errors = []
+    rows = 0
+    capacity = mb_spec.max_tokens_per_mb
+    if capacity is not None and (type(capacity) is not int or capacity < 1):
+        errors.append("max_tokens_per_mb must be positive or None")
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.ndim != 2:
+        errors.append("attention_mask must be a non-empty 2D tensor")
+    else:
+        rows, width = attention_mask.shape
+        if rows == 0 or width == 0:
+            errors.append("attention_mask must be a non-empty 2D tensor")
+        elif seq_lens is None or len(seq_lens) != rows:
+            errors.append("sequence lengths must match the row count")
+        elif any(
+            type(length) is not int or not 0 < length <= width for length in seq_lens
+        ):
+            errors.append("each row must contain valid positive sequence lengths")
+        else:
+            if type(capacity) is int and any(length > capacity for length in seq_lens):
+                errors.append(f"row exceeds max_tokens_per_mb={capacity}")
+    if type(mb_spec.granularity) is not int or mb_spec.granularity != 1:
+        errors.append("granularity must be 1")
+    if mb_spec.n_mbs is not None and (
+        type(mb_spec.n_mbs) is not int or not 1 <= mb_spec.n_mbs <= rows
+    ):
+        errors.append("n_mbs must be positive and no greater than the row count")
+    if (
+        type(mb_spec.n_mbs_divisor) is not int
+        or mb_spec.n_mbs_divisor < 1
+        or rows % mb_spec.n_mbs_divisor
+    ):
+        errors.append("row count must be divisible by positive n_mbs_divisor")
+    if tree_training or sp_size != 1:
+        errors.append("row isolation requires non-tree training with SP=1")
+
+    statuses = [(rows, errors)]
+    if dist.is_initialized():
+        if group is None:
+            raise ValueError("Qwen3.5 row isolation requires the engine CPU group")
+        world_size = dist.get_world_size(group)
+        if world_size > 1:
+            statuses = [None] * world_size
+            dist.all_gather_object(statuses, (rows, errors), group=group)
+    failures = [
+        f"rank {rank}: {', '.join(rank_errors)}"
+        for rank, (_, rank_errors) in enumerate(statuses)
+        if rank_errors
+    ]
+    row_counts = [count for count, _ in statuses]
+    if len(set(row_counts)) != 1:
+        failures.append(
+            f"all engine ranks must have equal row counts, got {row_counts}"
+        )
+    if failures:
+        raise ValueError("Qwen3.5 row isolation: " + "; ".join(failures))
+    return MicroBatchSpec.new(mb_spec, n_mbs=rows)
 
 
 class FSDPEngine(TrainEngine):
@@ -1805,6 +1886,25 @@ class FSDPEngine(TrainEngine):
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
         input_ = input_.copy()
+        mb_spec = self.config.mb_spec
+        isolate_rows = is_qwen3_5_model(self.model_config.model_type)
+        seq_lens = None
+        if isolate_rows:
+            # HF Qwen3.5 linear attention does not consume packed cu_seqlens.
+            # Keep each example in its own forward, for log-probs AND training.
+            # Move the splitter's existing length planning here so every rank
+            # validates before allocation, then reuse it without another sync.
+            attention_mask = input_["attention_mask"]
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+                seq_lens = attention_mask.sum(1).long().cpu().numpy().tolist()
+            mb_spec = _qwen3_5_row_isolated_mb_spec(
+                attention_mask,
+                mb_spec,
+                seq_lens=seq_lens,
+                group=self.cpu_group,
+                tree_training=self.enable_tree_training,
+                sp_size=self.parallel_helper.sp_size,
+            )
 
         # Tree training path
         if self.enable_tree_training:
@@ -1865,7 +1965,14 @@ class FSDPEngine(TrainEngine):
         else:
             input_ = amend_position_ids(input_)
 
-        mb_list = split_padded_tensor_dict_into_mb_list(input_, self.config.mb_spec)
+        mb_list = split_padded_tensor_dict_into_mb_list(
+            input_, mb_spec, _seq_lens=seq_lens
+        )
+        if isolate_rows and (
+            len(mb_list.mbs) != input_["attention_mask"].shape[0]
+            or any(mb["attention_mask"].shape[0] != 1 for mb in mb_list.mbs)
+        ):
+            raise RuntimeError("Qwen3.5 row isolation produced a multi-row micro-batch")
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         mb_list = pad_mb_list(
             mb_list,
