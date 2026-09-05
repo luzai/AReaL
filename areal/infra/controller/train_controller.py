@@ -73,6 +73,16 @@ def _item_weight(d: dict[str, Any]) -> int:
     return 1
 
 
+def _ppo_item_batch_size(item: dict[str, Any]) -> int:
+    """Count sequence rows without fetching remote tensor payloads."""
+    attention_mask = item.get("attention_mask")
+    if not isinstance(attention_mask, (torch.Tensor, RTensor)):
+        raise ValueError("PPO dispatch requires a tensor attention_mask per item")
+    if attention_mask.ndim != 2 or attention_mask.shape[0] <= 0:
+        raise ValueError("PPO dispatch requires a non-empty 2D attention_mask")
+    return int(attention_mask.shape[0])
+
+
 def _dispatch_tensors(
     item_list: list[dict[str, Any]],
     dp_size: int,
@@ -589,17 +599,26 @@ class TrainController:
     def _prepare_ppo_dispatch(
         self, *args, **kwargs
     ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]] | None]:
-        """Prepare PPO row dispatch with token-balanced uneven rank counts."""
+        """Prepare PPO dispatch with a shared target for actual sequence rows."""
 
         if "_ppo_target_batch_size" in kwargs:
             raise ValueError(
                 "_ppo_target_batch_size is reserved for PPO controller dispatch"
             )
         if _is_tensor_like(args) or _is_tensor_like(kwargs):
+            # Advantage results may be complete trajectory groups, not only
+            # singleton rows. Match the worker's concat_batch leading dimension
+            # rather than counting the number of Python containers per rank.
+            batch = next(
+                item for item in (*args, *kwargs.values()) if _is_tensor_like(item)
+            )
+            item_rows = [_ppo_item_batch_size(item) for item in batch]
             dp_args, dp_kwargs, group_indices = self._partition_ppo_inputs(
                 *args, **kwargs
             )
-            target_batch_size = max(len(indices) for indices in group_indices)
+            target_batch_size = max(
+                sum(item_rows[index] for index in indices) for indices in group_indices
+            )
             dp_kwargs["_ppo_target_batch_size"] = [
                 target_batch_size
             ] * self.parallel_strategy.dp_size
