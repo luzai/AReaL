@@ -18,6 +18,7 @@ import enum
 import importlib
 import importlib.util
 import io
+import math
 import os
 import subprocess
 import tempfile
@@ -542,7 +543,8 @@ def serialize_value(value: Any) -> Any:
     - Hugging Face processors -> SerializedProcessor dict
     - dict -> recursively serialize values
     - list/tuple -> recursively serialize elements
-    - primitives (int, float, str, bool, None) -> unchanged
+    - non-finite floats -> tagged dict (preserves inf/-inf/nan through JSON)
+    - other primitives (int, finite float, str, bool, None) -> unchanged
 
     Parameters
     ----------
@@ -622,7 +624,12 @@ def serialize_value(value: Any) -> Any:
             "value": value.value,
         }
 
-    # Primitives (int, float, str, bool) pass through unchanged
+    # JSON encoders such as orjson replace non-finite floats with null. Preserve
+    # config sentinels (e.g. reward_clip=inf) instead of silently restoring None.
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"type": "nonfinite_float", "value": str(value)}
+
+    # Other primitives (int, finite float, str, bool) pass through unchanged
     return value
 
 
@@ -635,6 +642,7 @@ def deserialize_value(value: Any) -> Any:
     - SerializedDataclass dict -> dataclass instance (reconstructed with original type)
     - SerializedTokenizer dict -> Hugging Face tokenizer
     - SerializedProcessor dict -> Hugging Face processor
+    - nonfinite_float dict -> original inf/-inf/nan float
     - dict -> recursively deserialize values
     - list -> recursively deserialize elements
     - primitives -> unchanged
@@ -655,6 +663,16 @@ def deserialize_value(value: Any) -> Any:
 
     # Handle dict - check if it's a SerializedDataclass or SerializedTensor
     if isinstance(value, dict):
+        if value.get("type") == "nonfinite_float":
+            encoded = value.get("value")
+            if (
+                set(value) != {"type", "value"}
+                or not isinstance(encoded, str)
+                or encoded not in {"inf", "-inf", "nan"}
+            ):
+                raise ValueError("Invalid nonfinite_float RPC payload")
+            return float(encoded)
+
         # Check for SerializedDataclass marker (check before tensor)
         if value.get("type") == "dataclass":
             try:
