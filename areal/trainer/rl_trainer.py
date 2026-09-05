@@ -278,6 +278,47 @@ def _compute_logp_in_rpc_chunks(
     return results
 
 
+def _resolve_pacman_action_token_ids(tokenizer: Any) -> tuple[int, int, int, int]:
+    """Resolve the atomic U/D/L/R IDs using the actor tokenizer contract."""
+
+    if tokenizer is None:
+        raise RuntimeError("Pacman action-mask audit requires the actor tokenizer")
+    encoded = [
+        tokenizer.encode(action, add_special_tokens=False)
+        for action in ("U", "D", "L", "R")
+    ]
+    if any(len(ids) != 1 for ids in encoded):
+        raise RuntimeError(
+            "Pacman actions must each map to exactly one tokenizer token"
+        )
+    token_ids = tuple(int(ids[0]) for ids in encoded)
+    if any(token_id < 0 for token_id in token_ids):
+        raise RuntimeError("Pacman action tokenizer IDs must be non-negative")
+    if len(set(token_ids)) != 4:
+        raise RuntimeError("Pacman action tokenizer IDs must be distinct")
+    return token_ids
+
+
+def _pacman_action_mask_bits_to_allowed_token_ids(
+    action_mask_bits: torch.Tensor,
+    action_token_ids: tuple[int, int, int, int],
+) -> torch.Tensor:
+    """Build the existing token-id-plus-one ledger on a detached CPU tensor."""
+
+    bits = action_mask_bits.detach().cpu()
+    if bits.dtype == torch.bool or bits.is_floating_point() or bits.is_complex():
+        raise RuntimeError("Pacman action mask bits must use an integer tensor dtype")
+    bits = bits.to(torch.long)
+    if bool(((bits < 0) | (bits > 0b1111)).any()):
+        raise RuntimeError(
+            "Pacman action mask bits must be in the inclusive range [0, 15]"
+        )
+    token_ids_plus_one = torch.tensor(action_token_ids, dtype=torch.long) + 1
+    bit_weights = torch.tensor((1, 2, 4, 8), dtype=torch.long)
+    allowed = bits.unsqueeze(-1).bitwise_and(bit_weights).ne(0)
+    return torch.where(allowed, token_ids_plus_one, 0)
+
+
 def _audit_pacman_logprob_alignment(
     batch: list[dict[str, Any]],
     *,
@@ -295,6 +336,7 @@ def _audit_pacman_logprob_alignment(
     singleton_max_abs_tolerance: float = 1.0e-7,
     require_actor_reference_alignment: bool = True,
     expected_option_tokens: int | None = None,
+    tokenizer: Any | None = None,
 ) -> dict[str, Any]:
     """Verify rollout and proximal actor option probabilities.
 
@@ -349,6 +391,8 @@ def _audit_pacman_logprob_alignment(
         )
     records: list[dict[str, Any]] = []
     support_sizes: set[int] = set()
+    support_sources: set[str] = set()
+    action_token_ids: tuple[int, int, int, int] | None = None
     for trajectory_index, trajectory in enumerate(batch):
         required = {
             "input_ids",
@@ -356,7 +400,6 @@ def _audit_pacman_logprob_alignment(
             "logprobs",
             "prox_logp",
             "versions",
-            "pacman_allowed_token_ids",
         }
         if reference_available:
             required.add("ref_logp")
@@ -365,6 +408,23 @@ def _audit_pacman_logprob_alignment(
             raise RuntimeError(
                 f"Pacman log-prob audit missing fields: {sorted(missing)}"
             )
+        has_action_mask_bits = "pacman_action_mask_bits" in trajectory
+        has_allowed_token_ids = "pacman_allowed_token_ids" in trajectory
+        if has_action_mask_bits and has_allowed_token_ids:
+            raise RuntimeError(
+                "Pacman atomic-action and option-token audit masks are mutually exclusive"
+            )
+        if not has_action_mask_bits and not has_allowed_token_ids:
+            raise RuntimeError(
+                "Pacman log-prob audit requires pacman_action_mask_bits or "
+                "pacman_allowed_token_ids"
+            )
+        support_field = (
+            "pacman_action_mask_bits"
+            if has_action_mask_bits
+            else "pacman_allowed_token_ids"
+        )
+        required.add(support_field)
         local = RTensor.localize({key: trajectory[key] for key in required})
         input_ids = local["input_ids"].detach().cpu()
         loss_mask = torch.roll(local["loss_mask"].detach().cpu().bool(), -1, dims=-1)
@@ -375,11 +435,21 @@ def _audit_pacman_logprob_alignment(
             local["ref_logp"].detach().cpu().float() if reference_available else None
         )
         sampled_ids = torch.roll(input_ids, -1, dims=-1)
-        supports = torch.roll(
-            local["pacman_allowed_token_ids"].detach().cpu(),
-            -1,
-            dims=-2,
-        )
+        rolled_action_mask_bits: torch.Tensor | None = None
+        if has_action_mask_bits:
+            if action_token_ids is None:
+                action_token_ids = _resolve_pacman_action_token_ids(tokenizer)
+            native_action_mask_bits = local["pacman_action_mask_bits"].detach().cpu()
+            token_id_ledger = _pacman_action_mask_bits_to_allowed_token_ids(
+                native_action_mask_bits, action_token_ids
+            )
+            rolled_action_mask_bits = torch.roll(native_action_mask_bits, -1, dims=-1)
+            support_source = "pacman_action_mask_bits"
+        else:
+            token_id_ledger = local["pacman_allowed_token_ids"].detach().cpu()
+            support_source = "pacman_allowed_token_ids"
+        support_sources.add(support_source)
+        supports = torch.roll(token_id_ledger, -1, dims=-2)
         expected_shape = rollout.shape
         shapes = (
             actor.shape,
@@ -424,18 +494,22 @@ def _audit_pacman_logprob_alignment(
                     values["actor"] - values["reference"]
                 )
             support_sizes.add(len(support))
-            records.append(
-                {
-                    "trajectory_index": trajectory_index,
-                    "sample_index": batch_index,
-                    "token_index": token_index,
-                    "sampled_token_id": sampled,
-                    "allowed_token_ids": support,
-                    "support_size": len(support),
-                    "version": int(versions[batch_index, token_index]),
-                    **values,
-                }
-            )
+            record = {
+                "trajectory_index": trajectory_index,
+                "sample_index": batch_index,
+                "token_index": token_index,
+                "sampled_token_id": sampled,
+                "allowed_token_ids": support,
+                "support_size": len(support),
+                "support_source": support_source,
+                "version": int(versions[batch_index, token_index]),
+                **values,
+            }
+            if rolled_action_mask_bits is not None:
+                record["action_mask_bits"] = int(
+                    rolled_action_mask_bits[batch_index, token_index]
+                )
+            records.append(record)
     if not records:
         raise RuntimeError("Pacman log-prob audit found no constrained tokens")
     if not any(size > 1 for size in support_sizes):
@@ -695,6 +769,12 @@ def _audit_pacman_logprob_alignment(
         "global_step": global_step,
         "tokens": len(records),
         "support_sizes": sorted(support_sizes),
+        "support_sources": sorted(support_sources),
+        "native_action_token_ids": (
+            dict(zip(("U", "D", "L", "R"), action_token_ids, strict=True))
+            if action_token_ids is not None
+            else None
+        ),
         "versions": version_values,
         "expected_option_tokens": expected_option_tokens,
         "max_abs_tolerance": max_abs_tolerance,
@@ -1520,6 +1600,7 @@ class PPOTrainer:
                     expected_option_tokens=int(
                         os.getenv("MAAPACMAN_EXPECTED_OPTION_TOKENS", "1")
                     ),
+                    tokenizer=self.tokenizer,
                 )
 
             with (

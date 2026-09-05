@@ -9,6 +9,15 @@ from areal.trainer.rl_trainer import _audit_pacman_logprob_alignment
 from areal.utils.functional import apply_rejection_sampling
 
 
+class AtomicActionTokenizer:
+    def __init__(self, mapping: dict[str, list[int]] | None = None) -> None:
+        self.mapping = mapping or {"U": [20], "D": [21], "L": [30], "R": [31]}
+
+    def encode(self, action: str, *, add_special_tokens: bool) -> list[int]:
+        assert not add_special_tokens
+        return self.mapping[action]
+
+
 def make_trajectory(actor_delta: float = 0.0, behavior_logp_delta: float = 0.0):
     # Prompt rows 0/1; sampled tokens on rows 2/3. The actor/ref tensors are
     # already causal-position aligned, while rollout metadata is token aligned.
@@ -22,6 +31,40 @@ def make_trajectory(actor_delta: float = 0.0, behavior_logp_delta: float = 0.0):
         "ref_logp": torch.tensor([[0.0, -0.25 + behavior_logp_delta, 0.0, 0.0]]),
         "versions": torch.tensor([[-1, -1, 0, 0]]),
         "pacman_allowed_token_ids": torch.tensor([[[0, 0], [0, 0], [21, 31], [22, 0]]]),
+    }
+
+
+def make_atomic_bitmask_trajectory(behavior_logp_delta: float = 0.0):
+    # One generated U token, with rollout-time support {U, L} encoded as bits 1|4.
+    return {
+        "input_ids": torch.tensor([[10, 11, 20]]),
+        "loss_mask": torch.tensor([[0, 0, 1]]),
+        "logprobs": torch.tensor([[0.0, 0.0, -0.25]]),
+        "prox_logp": torch.tensor([[0.0, -0.25 + behavior_logp_delta, 0.0]]),
+        "ref_logp": torch.tensor([[0.0, -0.25 + behavior_logp_delta, 0.0]]),
+        "versions": torch.tensor([[-1, -1, 0]]),
+        "pacman_action_mask_bits": torch.tensor([[0, 0, 5]], dtype=torch.uint8),
+    }
+
+
+def make_all_nonempty_atomic_masks_trajectory():
+    token_ids = (0, 7, 11, 13)
+    sampled_ids = [
+        token_ids[next(index for index in range(4) if mask & (1 << index))]
+        for mask in range(1, 16)
+    ]
+    singleton = [mask.bit_count() == 1 for mask in range(1, 16)]
+    token_logps = [0.0 if is_singleton else -0.25 for is_singleton in singleton]
+    return {
+        "input_ids": torch.tensor([[10, 12, sampled] for sampled in sampled_ids]),
+        "loss_mask": torch.tensor([[0, 0, 1] for _ in sampled_ids]),
+        "logprobs": torch.tensor([[0.0, 0.0, value] for value in token_logps]),
+        "prox_logp": torch.tensor([[0.0, value, 0.0] for value in token_logps]),
+        "ref_logp": torch.tensor([[0.0, value, 0.0] for value in token_logps]),
+        "versions": torch.tensor([[-1, -1, 0] for _ in sampled_ids]),
+        "pacman_action_mask_bits": torch.tensor(
+            [[0, 0, mask] for mask in range(1, 16)], dtype=torch.uint8
+        ),
     }
 
 
@@ -59,11 +102,286 @@ def test_pacman_logprob_alignment_writes_exact_support_report(tmp_path) -> None:
     assert report["aligned"]
     assert report["tokens"] == 2
     assert report["support_sizes"] == [1, 2]
+    assert report["support_sources"] == ["pacman_allowed_token_ids"]
+    assert report["native_action_token_ids"] is None
     stored = json.loads(
         (tmp_path / "global-step-000000.json").read_text(encoding="utf-8")
     )
     assert stored["records"][0]["sampled_token_id"] == 20
     assert stored["records"][0]["allowed_token_ids"] == [20, 30]
+    assert stored["records"][0]["support_source"] == "pacman_allowed_token_ids"
+    assert "action_mask_bits" not in stored["records"][0]
+
+
+def test_pacman_atomic_bitmask_writes_existing_support_report(tmp_path) -> None:
+    report = _audit_pacman_logprob_alignment(
+        [make_atomic_bitmask_trajectory()],
+        output_dir=str(tmp_path),
+        global_step=0,
+        expected_option_tokens=1,
+        tokenizer=AtomicActionTokenizer(),
+    )
+
+    assert report["accepted"]
+    assert report["tokens"] == 1
+    assert report["support_sizes"] == [2]
+    assert report["support_sources"] == ["pacman_action_mask_bits"]
+    assert report["native_action_token_ids"] == {
+        "U": 20,
+        "D": 21,
+        "L": 30,
+        "R": 31,
+    }
+    assert report["records"][0]["sampled_token_id"] == 20
+    assert report["records"][0]["allowed_token_ids"] == [20, 30]
+    assert report["records"][0]["support_source"] == "pacman_action_mask_bits"
+    assert report["records"][0]["action_mask_bits"] == 5
+
+
+def test_pacman_atomic_bitmask_supports_all_nonempty_masks_and_token_zero(
+    tmp_path,
+) -> None:
+    tokenizer = AtomicActionTokenizer({"U": [0], "D": [7], "L": [11], "R": [13]})
+    report = _audit_pacman_logprob_alignment(
+        [make_all_nonempty_atomic_masks_trajectory()],
+        output_dir=str(tmp_path),
+        global_step=0,
+        expected_option_tokens=1,
+        tokenizer=tokenizer,
+    )
+
+    assert report["accepted"]
+    assert report["aligned"]
+    assert report["tokens"] == 15
+    assert report["native_action_token_ids"] == {
+        "U": 0,
+        "D": 7,
+        "L": 11,
+        "R": 13,
+    }
+    assert [record["action_mask_bits"] for record in report["records"]] == list(
+        range(1, 16)
+    )
+    assert report["records"][0]["sampled_token_id"] == 0
+    assert report["records"][0]["allowed_token_ids"] == [0]
+    assert report["records"][0]["rollout"] == 0.0
+    assert report["behavior_metrics"]["singleton_max_abs_logp"] == 0.0
+
+
+def test_pacman_atomic_bitmask_audit_does_not_mutate_or_localize_payload(
+    tmp_path, monkeypatch
+) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    payload = object()
+    trajectory["multi_modal_input"] = payload
+    original_keys = set(trajectory)
+    original_tensors = {
+        key: value.clone()
+        for key, value in trajectory.items()
+        if isinstance(value, torch.Tensor)
+    }
+    localized_key_sets = []
+    localize = RTensor.localize
+
+    def localize_without_payload(fields):
+        localized_key_sets.append(set(fields))
+        return localize(fields)
+
+    monkeypatch.setattr(RTensor, "localize", staticmethod(localize_without_payload))
+
+    _audit_pacman_logprob_alignment(
+        [trajectory],
+        output_dir=str(tmp_path),
+        global_step=0,
+        tokenizer=AtomicActionTokenizer(),
+    )
+
+    assert set(trajectory) == original_keys
+    assert trajectory["multi_modal_input"] is payload
+    assert "pacman_allowed_token_ids" not in trajectory
+    assert localized_key_sets
+    assert all("multi_modal_input" not in keys for keys in localized_key_sets)
+    for key, expected in original_tensors.items():
+        assert torch.equal(trajectory[key], expected)
+
+
+def test_pacman_atomic_bitmask_alignment_localizes_rtensors(tmp_path) -> None:
+    trajectory = {
+        key: RTensor(shard=None, data=value)
+        for key, value in make_atomic_bitmask_trajectory().items()
+    }
+
+    report = _audit_pacman_logprob_alignment(
+        [trajectory],
+        output_dir=str(tmp_path),
+        global_step=0,
+        tokenizer=AtomicActionTokenizer(),
+    )
+
+    assert report["accepted"]
+    assert report["records"][0]["action_mask_bits"] == 5
+
+
+def test_pacman_atomic_bitmask_preserves_behavior_acceptance(tmp_path) -> None:
+    report = _audit_pacman_logprob_alignment(
+        [make_atomic_bitmask_trajectory(behavior_logp_delta=0.03)],
+        output_dir=str(tmp_path),
+        global_step=0,
+        acceptance_mode="behavior",
+        expected_option_tokens=1,
+        tokenizer=AtomicActionTokenizer(),
+    )
+
+    assert report["accepted"]
+    assert not report["aligned"]
+    assert report["behavior_compatible"]
+
+
+@pytest.mark.parametrize(
+    ("mask", "match"),
+    [
+        (0, "supports do not match"),
+        (16, "inclusive range"),
+        (-1, "inclusive range"),
+    ],
+)
+def test_pacman_atomic_bitmask_rejects_empty_or_illegal_masks(
+    tmp_path, mask: int, match: str
+) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["pacman_action_mask_bits"] = trajectory["pacman_action_mask_bits"].to(
+        torch.int16
+    )
+    trajectory["pacman_action_mask_bits"][0, -1] = mask
+
+    with pytest.raises(RuntimeError, match=match):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
+
+
+def test_pacman_atomic_bitmask_rejects_noninteger_masks(tmp_path) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["pacman_action_mask_bits"] = trajectory[
+        "pacman_action_mask_bits"
+    ].float()
+
+    with pytest.raises(RuntimeError, match="integer tensor dtype"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
+
+
+def test_pacman_atomic_bitmask_rejects_wrong_shape(tmp_path) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["pacman_action_mask_bits"] = torch.tensor([[0, 5]], dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError, match="tensor shapes disagree"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
+
+
+def test_pacman_atomic_bitmask_rejects_wrong_causal_shift(tmp_path) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["pacman_action_mask_bits"] = torch.tensor([[0, 5, 0]], dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError, match="supports do not match"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
+
+
+def test_pacman_atomic_bitmask_requires_tokenizer(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="requires the actor tokenizer"):
+        _audit_pacman_logprob_alignment(
+            [make_atomic_bitmask_trajectory()],
+            output_dir=str(tmp_path),
+            global_step=0,
+        )
+
+
+def test_pacman_atomic_bitmask_rejects_sampled_token_outside_mask(tmp_path) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["pacman_action_mask_bits"][0, -1] = 4
+
+    with pytest.raises(RuntimeError, match="sampled token is absent"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
+
+
+def test_pacman_atomic_bitmask_preserves_finite_logprob_gate(tmp_path) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["prox_logp"][0, 1] = torch.nan
+
+    with pytest.raises(RuntimeError, match="NaN or Inf"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
+
+
+def test_pacman_atomic_bitmask_preserves_version_gate(tmp_path) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["versions"][0, -1] = -1
+
+    with pytest.raises(RuntimeError, match="inconsistent versions"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("mapping", "match"),
+    [
+        ({"U": [20], "D": [21], "L": [30], "R": [31, 32]}, "exactly one"),
+        ({"U": [20], "D": [20], "L": [30], "R": [31]}, "must be distinct"),
+    ],
+)
+def test_pacman_atomic_bitmask_rejects_invalid_tokenizer_mapping(
+    tmp_path, mapping: dict[str, list[int]], match: str
+) -> None:
+    with pytest.raises(RuntimeError, match=match):
+        _audit_pacman_logprob_alignment(
+            [make_atomic_bitmask_trajectory()],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(mapping),
+        )
+
+
+def test_pacman_atomic_and_option_supports_are_mutually_exclusive(tmp_path) -> None:
+    trajectory = make_atomic_bitmask_trajectory()
+    trajectory["pacman_allowed_token_ids"] = torch.tensor([[[0, 0], [0, 0], [21, 31]]])
+
+    with pytest.raises(RuntimeError, match="mutually exclusive"):
+        _audit_pacman_logprob_alignment(
+            [trajectory],
+            output_dir=str(tmp_path),
+            global_step=0,
+            tokenizer=AtomicActionTokenizer(),
+        )
 
 
 def test_pacman_logprob_alignment_fails_closed_on_delta(tmp_path) -> None:
