@@ -10,7 +10,11 @@ import torch
 import torch.distributed as dist
 
 from areal.api.cli_args import MicroBatchSpec
-from areal.engine.fsdp_engine import FSDPEngine, _qwen3_5_row_isolated_mb_spec
+from areal.engine.fsdp_engine import (
+    FSDPEngine,
+    _qwen3_5_row_isolated_mb_spec,
+    _uses_qwen_multimodal_position_ids,
+)
 from areal.utils.data import split_padded_tensor_dict_into_mb_list
 
 
@@ -19,6 +23,7 @@ def _batch(lengths):
     data = {
         "input_ids": torch.zeros(len(lengths), width, dtype=torch.long),
         "attention_mask": torch.zeros(len(lengths), width, dtype=torch.bool),
+        "mm_token_type_ids": torch.zeros(len(lengths), width, dtype=torch.long),
         "loss_mask": torch.zeros(len(lengths), width, dtype=torch.bool),
         "pacman_action_mask_bits": torch.zeros(len(lengths), width, dtype=torch.long),
         "episode_loss_weights": torch.zeros(len(lengths), width),
@@ -26,17 +31,53 @@ def _batch(lengths):
     }
     for row, length in enumerate(lengths):
         data["input_ids"][row, :length] = row + 1
+        # Two distinct non-square image grids exercise real spatial positions.
+        grid = [1, 4, 6] if row % 2 == 0 else [1, 6, 4]
+        data["mm_token_type_ids"][row, 2:8] = 1
         data["attention_mask"][row, :length] = True
         data["loss_mask"][row, length - 1] = True
         data["pacman_action_mask_bits"][row, length - 1] = 1 << (row % 4)
         data["episode_loss_weights"][row, length - 1] = 0.25
         data["multi_modal_input"].append(
             {
-                "pixel_values": torch.full((2, 4), float(row)),
-                "image_grid_thw": torch.tensor([[1, 1, 2]]),
+                "pixel_values": torch.full((24, 4), float(row)),
+                "image_grid_thw": torch.tensor([grid]),
             }
         )
     return data
+
+
+def _position_model(model_type="qwen3_5"):
+    """Use real HF RoPE methods without constructing any model weights."""
+    if model_type == "qwen3_5_moe":
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeModel,
+        )
+
+        model_class = Qwen3_5MoeModel
+    else:
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model
+
+        model_class = Qwen3_5Model
+    model = object.__new__(model_class)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+    model.rope_deltas = None
+    assert list(model.parameters()) == []
+    return model
+
+
+def _expected_positions(data, model_type):
+    return _position_model(model_type).compute_3d_position_ids(
+        input_ids=data["input_ids"],
+        inputs_embeds=None,
+        attention_mask=data["attention_mask"],
+        mm_token_type_ids=data["mm_token_type_ids"],
+        image_grid_thw=torch.cat(
+            [item["image_grid_thw"] for item in data["multi_modal_input"]]
+        ),
+        past_key_values=None,
+    )
 
 
 @pytest.fixture
@@ -71,19 +112,30 @@ def _engine(group, model_type="qwen3_5", **spec_kwargs):
     engine.parallel_helper = SimpleNamespace(sp_size=1)
     engine.enable_tree_training = False
     engine.logger = SimpleNamespace(info=lambda _: None)
+    if model_type in ("qwen3_5", "qwen3_5_moe"):
+        engine.model = SimpleNamespace(model=_position_model(model_type))
     return engine
 
 
 @pytest.mark.parametrize("algorithm", ["ffd", "kk"])
 @pytest.mark.parametrize("rows", [1, 4, 32])
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
 def test_qwen35_preparation_keeps_one_row_and_matching_payloads(
-    cpu_group, algorithm, rows
+    cpu_group, algorithm, rows, model_type
 ):
     """Keep every token, image, action mask, and loss weight in its own forward."""
     lengths = [478 + 2 * (i % 17) for i in range(rows)]
     data = _batch(lengths)
     before = copy.deepcopy(data)
-    engine = _engine(cpu_group, packing_algorithm=algorithm)
+    expected_positions = _expected_positions(before, model_type)
+    # The first image is a 2x3 merged grid, following two text tokens.
+    torch.testing.assert_close(
+        expected_positions[:, 0, 2:8],
+        torch.tensor([[2, 2, 2, 2, 2, 2], [2, 2, 2, 3, 3, 3], [2, 3, 4, 2, 3, 4]]),
+        rtol=0,
+        atol=0,
+    )
+    engine = _engine(cpu_group, model_type=model_type, packing_algorithm=algorithm)
 
     result = engine._prepare_mb_list(data)
 
@@ -108,6 +160,7 @@ def test_qwen35_preparation_keeps_one_row_and_matching_payloads(
         )
         for key in (
             "input_ids",
+            "mm_token_type_ids",
             "loss_mask",
             "pacman_action_mask_bits",
             "episode_loss_weights",
@@ -122,11 +175,60 @@ def test_qwen35_preparation_keeps_one_row_and_matching_payloads(
             rtol=0,
             atol=0,
         )
-        assert padded["position_ids"].shape == padded["input_ids"].shape
+        torch.testing.assert_close(
+            padded["image_grid_thw"],
+            before["multi_modal_input"][row]["image_grid_thw"],
+            rtol=0,
+            atol=0,
+        )
+        assert padded["position_ids"].shape == (3, *padded["input_ids"].shape)
+        torch.testing.assert_close(
+            padded["position_ids"][:, 0, : lengths[row]],
+            expected_positions[:, row, : lengths[row]],
+            rtol=0,
+            atol=0,
+        )
+        # Image coordinates must not silently collapse to a text arange.
+        assert not torch.equal(expected_positions[0, row], expected_positions[1, row])
     assert sum(mb["loss_mask"].sum().item() for mb in result.mbs) == rows
     assert (
         sum(mb["episode_loss_weights"].sum().item() for mb in result.mbs) == rows * 0.25
     )
+
+
+@pytest.mark.parametrize(
+    "model_type,expected",
+    [
+        ("qwen2_vl", True),
+        ("qwen2_5_vl", True),
+        ("qwen3_vl", True),
+        ("qwen3_vl_moe", True),
+        ("qwen3_5", True),
+        ("qwen3_5_moe", True),
+        ("qwen3_5_text", False),
+        ("qwen3_5_moe_text", False),
+        ("qwen3", False),
+    ],
+)
+def test_multimodal_positions_classify_only_vision_models(model_type, expected):
+    """Do not route hybrid text-only models into multimodal preparation."""
+    assert _uses_qwen_multimodal_position_ids(model_type) is expected
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+def test_qwen35_text_keeps_one_dimensional_positions(cpu_group, model_type):
+    """Text-only recurrent models retain isolation without requiring image fields."""
+    lengths = [478, 502]
+    data = _batch(lengths)
+    del data["multi_modal_input"], data["mm_token_type_ids"]
+    result = _engine(cpu_group, model_type=model_type)._prepare_mb_list(data)
+    assert result.group_lens == lengths
+    assert len(result.mbs) == len(lengths)
+    for length, padded in zip(lengths, result.padded_mbs, strict=True):
+        assert padded["position_ids"].shape == padded["input_ids"].shape
+        torch.testing.assert_close(
+            padded["position_ids"][0, :length], torch.arange(length), rtol=0, atol=0
+        )
 
 
 def test_non_qwen35_keeps_existing_two_row_packing(cpu_group):

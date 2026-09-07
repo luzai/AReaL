@@ -223,6 +223,14 @@ def _prepare_multimodal_forward_inputs(
     _drop_multimodal_payloads(mb)
 
 
+def _uses_qwen_multimodal_position_ids(model_type: str) -> bool:
+    """Select visual mRoPE without changing weight-sync family classification."""
+    return is_qwen_vl_model(model_type) or model_type in (
+        "qwen3_5",
+        "qwen3_5_moe",
+    )
+
+
 def _qwen3_5_row_isolated_mb_spec(
     attention_mask: torch.Tensor,
     mb_spec: MicroBatchSpec,
@@ -1933,7 +1941,7 @@ class FSDPEngine(TrainEngine):
             )
             return mb_list
 
-        if is_qwen_vl_model(self.model_config.model_type):
+        if _uses_qwen_multimodal_position_ids(self.model_config.model_type):
             attn_mask = input_["attention_mask"]
             input_ids = input_["input_ids"]
             # NOTE: Qwen-VL get_rope_index performs indexed assignment where
@@ -1995,7 +2003,7 @@ class FSDPEngine(TrainEngine):
             f"padded to: {mb_list.padded_to_lengths}, padding lengths: {mb_list.padding_lengths}"
         )
         mb_list = unsqueeze_mb_list(mb_list)
-        if is_qwen_vl_model(self.model_config.model_type):
+        if _uses_qwen_multimodal_position_ids(self.model_config.model_type):
             assert mb_list.padded_mbs is not None
             for mb in mb_list.padded_mbs:
                 mb["position_ids"] = torch.einsum("ijk->kij", mb["position_ids"])
