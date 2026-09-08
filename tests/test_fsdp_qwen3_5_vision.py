@@ -87,6 +87,7 @@ def test_real_vision_fsdp_bf16_forward_backward(tmp_path, checkpointing, offload
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import CPUOffloadPolicy
+    from torch.nn.attention import SDPBackend, sdpa_kernel
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
@@ -131,11 +132,22 @@ def test_real_vision_fsdp_bf16_forward_backward(tmp_path, checkpointing, offload
         )
         pixels = torch.randn(16, 12, device="cuda", dtype=torch.bfloat16)
         grid = torch.tensor([[1, 4, 4]], device="cuda")
-        expected = reference(pixels, grid_thw=grid).pooler_output
-        actual = model(pixels, grid_thw=grid).pooler_output
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        actual.float().square().mean().backward()
-        expected.float().square().mean().backward()
+        # This tiny head-dim=8 model tests FSDP dtype boundaries, not cuDNN's
+        # shape support. cuDNN SDPA can fail to build a plan here. Select the
+        # non-cuDNN path explicitly rather than relying on vLLM import side
+        # effects; the context restores the caller's backend flags afterwards.
+        with sdpa_kernel(
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+        ):
+            expected = reference(pixels, grid_thw=grid).pooler_output
+            actual = model(pixels, grid_thw=grid).pooler_output
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            actual.float().square().mean().backward()
+            expected.float().square().mean().backward()
         for (_, parameter), (_, ref_parameter) in zip(
             model.named_parameters(), reference.named_parameters()
         ):
