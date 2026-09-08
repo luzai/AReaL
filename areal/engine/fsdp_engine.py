@@ -231,6 +231,21 @@ def _uses_qwen_multimodal_position_ids(model_type: str) -> bool:
     )
 
 
+def _configure_qwen3_5_vision_sdpa(
+    model_type: str, *, is_vision_model: bool, device_type: str
+) -> bool:
+    """Match vLLM's non-cuDNN CUDA SDPA policy for dense Qwen3.5 VLM workers.
+
+    This is process-wide, like vLLM's CUDA platform policy. Other SDPA backend
+    flags, parameter dtypes and reduction precision remain unchanged. Do not
+    depend on whether this process happened to import the vLLM CUDA platform.
+    """
+    if model_type != "qwen3_5" or not is_vision_model or device_type != "cuda":
+        return False
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    return True
+
+
 def _qwen3_5_row_isolated_mb_spec(
     attention_mask: torch.Tensor,
     mb_spec: MicroBatchSpec,
@@ -471,6 +486,16 @@ class FSDPEngine(TrainEngine):
 
         if is_tms_enabled():
             torch_memory_saver.hook_mode = "preload"
+
+        if _configure_qwen3_5_vision_sdpa(
+            self.model_config.model_type,
+            is_vision_model=self.is_vision_model,
+            device_type=current_platform.device_type,
+        ):
+            self.logger.info(
+                "Dense Qwen3.5 vision worker: disabled cuDNN CUDA SDPA in this "
+                "engine process to match vLLM; other SDPA backends are unchanged."
+            )
 
         # Create device model
         self._create_device_model()
