@@ -3,6 +3,7 @@
 import math
 from abc import ABC
 from contextlib import contextmanager
+from dataclasses import replace
 
 import torch
 import torch.distributed as dist
@@ -92,8 +93,7 @@ def apply_fsdp2(model, fsdp_kwargs, wrap_policy):
     modules = []
     for name, module in model.named_modules():
         is_embedding = (
-            isinstance(module, nn.Embedding)
-            and not model.config.tie_word_embeddings
+            isinstance(module, nn.Embedding) and not model.config.tie_word_embeddings
         )
         if is_embedding and name.rpartition(".")[2] == "pos_embed":
             parent_name = name.rpartition(".")[0]
@@ -113,7 +113,18 @@ def apply_fsdp2(model, fsdp_kwargs, wrap_policy):
             modules.append(module)
 
     for idx, module in enumerate(modules):
-        fully_shard(module, **fsdp_kwargs)
+        module_kwargs = fsdp_kwargs
+        if module.__class__.__name__ == "Qwen3_5VisionBlock":
+            # Hidden states already have the compute dtype, but HF deliberately
+            # computes vision RoPE sin/cos in FP32. FSDP's recursive input cast
+            # otherwise rounds those angles before attention sees them.
+            policy = fsdp_kwargs.get("mp_policy")
+            if policy is not None:
+                module_kwargs = {
+                    **fsdp_kwargs,
+                    "mp_policy": replace(policy, cast_forward_inputs=False),
+                }
+        fully_shard(module, **module_kwargs)
     # NOTE: FSDP2 is not compatible with AutoModelForSequenceClassification, so we needs the patch
     # see: https://github.com/volcengine/verl/pull/3072
     with maybe_patch_fsdp_module(model):
