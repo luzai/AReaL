@@ -1368,6 +1368,24 @@ class PPOTrainer:
         elif self._requires_proxy_workflow(workflow):
             self._ensure_proxy_started()
 
+        if (
+            self.config.evaluator.eval_before_train
+            and self.eval_rollout is not None
+            and self.valid_dataloader is not None
+            and eval_workflow is not None
+        ):
+            if self._should_offload_rollout:
+                self._onload_rollout(is_eval=True)
+            self.evaluator.evaluate_before_train(
+                functools.partial(
+                    self._evaluate_fn,
+                    eval_workflow=eval_workflow,
+                    eval_workflow_kwargs=eval_workflow_kwargs,
+                )
+            )
+            if self._should_offload_rollout:
+                self._offload_rollout(is_eval=True)
+
         for global_step in range(start_step, max_steps):
             if (
                 config.total_train_steps is not None
