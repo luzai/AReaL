@@ -80,6 +80,22 @@ class VLLMBackend:
         if gconfig.stop:
             payload["stop"] = gconfig.stop
 
+        # ModelRequest.metadata is the process-safe transport for request-scoped
+        # sampling controls. The backend runs in the rollout worker, which is
+        # separate from the workflow process that creates the request.
+        metadata = req.metadata or {}
+        allowed_token_ids = metadata.get("allowed_token_ids")
+        if allowed_token_ids:
+            payload["allowed_token_ids"] = [
+                int(token_id) for token_id in allowed_token_ids
+            ]
+        structured_outputs = metadata.get("structured_outputs")
+        if structured_outputs is not None:
+            payload["structured_outputs"] = dict(structured_outputs)
+        chat_template_kwargs = metadata.get("chat_template_kwargs")
+        if chat_template_kwargs is not None:
+            payload["chat_template_kwargs"] = dict(chat_template_kwargs)
+
         if with_lora:
             lora_name = gconfig.lora_name
             if not lora_name:
