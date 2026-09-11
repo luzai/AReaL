@@ -78,7 +78,9 @@ class StatsLogger:
         )
 
         swanlab_config = self.config.swanlab
-        if swanlab_config.mode != "disabled":
+        # Offline runs write locally and must not attempt a network login.  A
+        # login here blocks startup on compute nodes without SwanLab egress.
+        if swanlab_config.mode not in ("disabled", "offline"):
             if swanlab_config.api_key:
                 swanlab.login(swanlab_config.api_key)
             else:

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from areal.api.cli_args import (
     StatsLoggerConfig,
+    SwanlabConfig,
     TrackioConfig,
 )
 
@@ -100,6 +101,26 @@ def _make_ft_spec():
 
 class TestStatsLoggerTrackioIntegration:
     """Tests for Trackio integration in StatsLogger (mocked)."""
+
+    @patch("areal.utils.stats_logger.trackio")
+    @patch("areal.utils.stats_logger.wandb")
+    @patch("areal.utils.stats_logger.swanlab")
+    @patch("areal.utils.stats_logger.dist")
+    def test_swanlab_offline_skips_login(
+        self, mock_dist, mock_swanlab, mock_wandb, mock_trackio
+    ):
+        """Offline SwanLab logging must not require network access."""
+        mock_dist.is_initialized.return_value = False
+        config = _make_test_config()
+        config.stats_logger.swanlab = SwanlabConfig(mode="offline")
+
+        from areal.utils.stats_logger import StatsLogger
+
+        StatsLogger(config, _make_ft_spec())
+
+        mock_swanlab.login.assert_not_called()
+        mock_swanlab.init.assert_called_once()
+        assert mock_swanlab.init.call_args.kwargs["mode"] == "offline"
 
     @patch("areal.utils.stats_logger.trackio")
     @patch("areal.utils.stats_logger.wandb")
