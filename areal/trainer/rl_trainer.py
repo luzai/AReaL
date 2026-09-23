@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import math
@@ -51,7 +52,7 @@ from areal.infra.data_service import DataController
 from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.infra.rpc.rtensor import RTensor
-from areal.infra.utils.concurrent import call_maybe_async
+from areal.infra.utils.concurrent import call_maybe_async, run_async_task
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
@@ -79,6 +80,20 @@ if TYPE_CHECKING:
     from areal.trainer.ppo.critic import PPOCriticController
 
 logger = logging.getLogger("RLTrainer")
+
+
+async def _clear_eval_result(result: Any) -> None:
+    """Release evaluation shards without fetching their tensor payloads."""
+    shards = RTensor.collect_shards(result)
+    outcomes = await asyncio.gather(
+        *(RTensor.clear_node(addr, ids) for addr, ids in shards.items()),
+        return_exceptions=True,
+    )
+    # Attempt every storage node, but never silently continue after failed cleanup.
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+
 
 EPISODE_GRPO_ROLLOUT_FIELDS = (
     "rollout_episode_ids",
@@ -2289,7 +2304,14 @@ class PPOTrainer:
                         is_eval=True,
                     )
                     cnt += 1
-            self.eval_rollout.wait(cnt, timeout=None)
+            for _ in range(cnt):
+                result = self.eval_rollout.wait(1, timeout=None)
+                try:
+                    # Evaluation statistics are recorded by the workflow. These
+                    # tensors have no training consumer to clear their RPC shards.
+                    run_async_task(_clear_eval_result, result)
+                finally:
+                    del result
 
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)

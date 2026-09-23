@@ -265,6 +265,7 @@ class HttpRTensorBackend:
             async with session.delete(
                 f"http://{base}/data/clear", json={"shard_ids": shard_ids}
             ) as resp:
+                resp.raise_for_status()
                 if resp.status == 200:
                     await resp.json()
 

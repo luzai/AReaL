@@ -69,6 +69,34 @@ def rpc_server():
 class TestRTensorIntegration:
     """Integration tests using real RPC server."""
 
+    def test_delete_propagates_http_error(self, rpc_server):
+        import aiohttp
+
+        backend = HttpRTensorBackend()
+        with pytest.raises(aiohttp.ClientResponseError):
+            asyncio.run(backend.delete(f"{rpc_server}/missing", ["unused"]))
+
+    def test_eval_cleanup_deletes_remote_image_payload(self, rpc_server):
+        from areal.trainer.rl_trainer import _clear_eval_result
+
+        for _ in range(5):
+            shard_id = str(uuid.uuid4())
+            tensor = torch.ones(1024, dtype=torch.float32)
+            response = requests.put(
+                f"http://{rpc_server}/data/{shard_id}",
+                data=orjson.dumps(serialize_value(tensor)),
+                timeout=10,
+            )
+            assert response.status_code == 200
+            handle = RTensor(
+                shard=TensorShardInfo(shard_id=shard_id, node_addr=rpc_server),
+                data=tensor.to("meta"),
+            )
+            result = [{"multi_modal_input": [{"pixel_values": handle}]}]
+            asyncio.run(_clear_eval_result(result))
+            response = requests.get(f"http://{rpc_server}/data/{shard_id}", timeout=10)
+            assert response.status_code == 404
+
     def test_single_shard_storage_and_retrieval(self, rpc_server):
         """Test storing and retrieving a single tensor shard (InferenceEngine workflow)."""
         # Create tensor and shard ID
