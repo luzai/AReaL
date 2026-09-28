@@ -53,7 +53,14 @@ from areal.infra.data_service.controller.config import DataServiceConfig
 from areal.infra.data_service.rdataset import RDataset
 from areal.infra.rpc.rtensor import RTensor
 from areal.infra.utils.concurrent import call_maybe_async, run_async_task
-from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils import (
+    logging,
+    name_resolve,
+    names,
+    perf_tracer,
+    seeding,
+    stats_tracker,
+)
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
@@ -891,6 +898,11 @@ class PPOTrainer:
             config.rollout.backend, name="rollout"
         )
         self._should_offload_rollout = self._is_actor_rollout_colocated(config)
+        self._colocated_vllm = (
+            self._should_offload_rollout and self.rollout_alloc.backend == "vllm"
+        )
+        self._initial_train_offload_done = False
+        self._initial_rollout_offload_done = False
         self._should_offload_actor = (
             self._should_offload_rollout or config.actor.offload
         )
@@ -1061,6 +1073,11 @@ class PPOTrainer:
         # Save initial LoRA weights if enabled (for inference server pre-loading)
         initial_lora_path = self._save_initial_lora_weights()
 
+        # vLLM profiles free device memory during startup. Release training
+        # allocations before launching it on the same devices.
+        if self._colocated_vllm:
+            self._offload_train_models_initially()
+
         # Initialize inference with LoRA path
         self.rollout = self._init_rollout(
             config.rollout, is_eval=False, lora_path=initial_lora_path
@@ -1152,7 +1169,10 @@ class PPOTrainer:
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
             )
 
-        self.actor.connect_engine(self.rollout, self.weight_update_meta)
+        if self._colocated_vllm:
+            self._connect_colocated_vllm()
+        else:
+            self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
         # Set up evaluation (skip in online mode)
         self.evaluator = Evaluator(config.evaluator, ft_spec)
@@ -1335,8 +1355,12 @@ class PPOTrainer:
             raise cleanup_error
 
     def _apply_initial_offload_policy(self) -> None:
-        if self._should_offload_rollout:
+        if self._should_offload_rollout and not self._initial_rollout_offload_done:
             self._offload_rollout()
+        if not self._initial_train_offload_done:
+            self._offload_train_models_initially()
+
+    def _offload_train_models_initially(self) -> None:
         if self._should_offload_ref:
             self._offload_model(self.ref, role="ref")
         if self._should_offload_critic:
@@ -1345,6 +1369,76 @@ class PPOTrainer:
             self._offload_model(self.teacher, role="teacher")
         if self._should_offload_actor:
             self._offload_model(self.actor, role="actor")
+        self._initial_train_offload_done = True
+
+    def _connect_colocated_vllm(self) -> None:
+        # Control RPC argument broadcast uses CUDA too. Connect only while the
+        # actor is awake, with inference asleep to avoid overlapping allocations.
+        self._offload_rollout()
+        self._initial_rollout_offload_done = True
+        self._onload_model(self.actor, role="actor_connect")
+        try:
+            self.actor.connect_engine(self.rollout, self.weight_update_meta)
+        finally:
+            self._offload_model(self.actor, role="actor_connect")
+
+    def _update_colocated_vllm_weights(self, meta: WeightUpdateMeta) -> None:
+        """Reload full weights without overlapping actor and inference memory.
+
+        The rollout queue remains paused throughout. Restore the actor only
+        after inference has safely released its allocations, including errors.
+        """
+        if meta.type != "disk" or meta.use_lora or meta.path is None:
+            raise ValueError("Colocated vLLM requires full disk weights with a path")
+        started = time.perf_counter()
+        self.actor.save(
+            SaveLoadMeta(
+                path=meta.path,
+                weight_format="hf",
+                with_optim=False,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+            )
+        )
+        saved = time.perf_counter()
+        self._offload_model(self.actor, role="actor_weight_sync")
+        actor_offloaded = time.perf_counter()
+        try:
+            # This vLLM allocator sleeps all allocations. A partial weight-only
+            # wake followed by sleep can unmap still-sleeping KV allocations twice.
+            self.rollout.onload()
+            rollout_awake = time.perf_counter()
+            # The existing disk loader waits on the OLD engine version.
+            name_resolve.add(
+                names.update_weights_from_disk(
+                    self.config.rollout.experiment_name,
+                    self.config.rollout.trial_name,
+                    self.rollout.get_version(),
+                ),
+                str(datetime.now().timestamp()),
+                keepalive_ttl=120,
+            )
+            call_maybe_async(self.rollout.update_weights_from_disk, meta)
+            reloaded = time.perf_counter()
+        finally:
+            # If sleep fails, do not wake the actor into possibly occupied VRAM.
+            self.rollout.offload()
+            rollout_asleep = time.perf_counter()
+            self._onload_model(self.actor, role="actor_weight_sync")
+        logger.info(
+            "COLOCATED_WEIGHT_SYNC version=%s save_seconds=%.3f "
+            "actor_offload_seconds=%.3f rollout_wake_seconds=%.3f "
+            "reload_seconds=%.3f rollout_sleep_seconds=%.3f "
+            "actor_onload_seconds=%.3f total_seconds=%.3f",
+            meta.version,
+            saved - started,
+            actor_offloaded - saved,
+            rollout_awake - actor_offloaded,
+            reloaded - rollout_awake,
+            rollout_asleep - reloaded,
+            time.perf_counter() - rollout_asleep,
+            time.perf_counter() - started,
+        )
 
     def train(
         self,
@@ -1784,7 +1878,10 @@ class PPOTrainer:
                 # Use versioned path for weight updates
                 new_version = global_step + 1
                 versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
+                if self._colocated_vllm:
+                    self._update_colocated_vllm_weights(versioned_meta)
+                else:
+                    self.actor.update_weights(versioned_meta)
 
                 self.actor.set_version(new_version)
                 if self.critic is not None:
@@ -2361,6 +2458,29 @@ class PPOTrainer:
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         actor_backend = self.actor_alloc.backend
+        if self._colocated_vllm:
+            if (
+                not is_single_controller()
+                or actor_backend != "fsdp"
+                or self.config.rollout._version != "v1"
+                or self.config.actor.use_lora
+            ):
+                raise ValueError(
+                    "Colocated vLLM currently requires v1 single-controller FSDP "
+                    "with full/merged weights."
+                )
+            if not self.config.vllm.enable_sleep_mode:
+                raise ValueError("Colocated vLLM requires vllm.enable_sleep_mode=True")
+            recover = self.config.recover
+            if recover.mode not in ("disabled", "off") and os.path.exists(
+                RecoverHandler.recover_info_path(
+                    recover.experiment_name, recover.trial_name, recover.fileroot
+                )
+            ):
+                raise ValueError(
+                    "Colocated vLLM checkpoint resume is not supported yet; "
+                    "use a fresh experiment directory. Optimizer saving is supported."
+                )
         requires_train_engine_offload = any(
             (
                 self._should_offload_rollout,
